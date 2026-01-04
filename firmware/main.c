@@ -106,22 +106,32 @@ const float lipo_voltage_map[] = {4.1, 3.98, 3.92, 3.87, 3.8, 3.7, 3.6, 3.5, 3.4
 
 typedef enum
 {
-    STATE_SCANNER,
+    STATE_SCANNER = 0,
     STATE_MENU,
     STATE_INFO,
     STATE_SETTINGS
 } app_state_t;
 
 app_state_t current_state = STATE_SCANNER;
-int menu_selection = 0;
-#ifdef OLED_TYPE_SH1106
-#define MENU_ITEMS 4
-#else
-#define MENU_ITEMS 5
+
+typedef enum {
+    MENU_BACK = 0,
+    MENU_ABOUT,
+    MENU_SLEEP,
+    MENU_FIRMWARE_UPDATE,
+#ifndef OLED_TYPE_SH1106
+    MENU_SETTINGS,
+#endif
+    NR_MENU_ITEMS // is not a menu entry, serves as maximum marker
+} menu_item_t;
+
+int menu_selection = 0; // int and not enum because I iterate
+
+#ifndef OLED_TYPE_SH1106
 static uint8_t m_contrast_level = 32;
 #endif
 
-const char *menu_items[MENU_ITEMS] =
+const char *menu_item_names[NR_MENU_ITEMS] =
 {
     "Back",
     "About",
@@ -132,14 +142,22 @@ const char *menu_items[MENU_ITEMS] =
 #endif
 };
 
-int scanner_selection = 0;
-#define SCANNER_MODES 4
-const char *scanner_mode_names[SCANNER_MODES] =
+typedef enum
+{
+    SCAN_MODE_FREQUENCY = 0,
+    SCAN_MODE_802_15_4,
+    SCAN_MODE_802_11,
+    SCAN_MODE_BLE,
+    NR_SCANNER_MODES // is not a scanner mode, serves as maximum marker
+} scanner_mode_t;
+
+int scanner_selection = 0; // int and not enum because I iterate
+const char *scanner_mode_names[NR_SCANNER_MODES] =
 {
     "Freq",
     "802.15.4",
-    "WiFi B/G/N",
-    "BLE"
+    "802.11b/g/n",
+    "BLE",
 };
 
 #define FONT_START 32
@@ -241,7 +259,7 @@ const char font5x7[FONT_END - FONT_START + 1][5] = {
     {0x00, 0x00, 0x7F, 0x00, 0x00}, // '|'
     {0x00, 0x41, 0x36, 0x08, 0x00}, // '}'
     {0x10, 0x08, 0x08, 0x10, 0x08}, // '~'
-    {0x00, 0x7F, 0x3E, 0x1C, 0x08}, // '►', as 0x7F
+    {0x00, 0x7F, 0x3E, 0x1C, 0x08}  // '►', as 0x7F
 };
 // I repeat the FONT_END - FONT_START in the definition, as that makes the compiler check the size
 
@@ -653,6 +671,7 @@ void draw_nr_vertical(int x, int y, int nr)
 void draw_text_buf_centered(int y, const char *str)
 {
     int len = strlen(str);
+    if (len == 0) return;
     int total_width = len * 6; // 5 pixels + 1 pixel space
     int start_x = (DISP_W - total_width) / 2;
     draw_text_buf(start_x, y, str);
@@ -1138,23 +1157,25 @@ const int8_t freq_to_channel_map[BANDWIDTH][3] = {
  * @brief Convert frequency to channel number for given mode
  * 
  * @param freq Frequency in MHz, already offset by SCAN_BASE_FREQ
- * @param mode 1 = IEEE 802.15.4, 2 = WiFi 802.11b/g/n, 3 = BLE
+ * @param mode SCAN_MODE_802_15_4, SCAN_MODE_802_11, SCAN_MODE_BLE
  * @return int Channel number, or -1 if not a valid channel for that mode
  **/
 int freq_to_channel(int freq, int mode)
 {
-    if (mode < 1 || mode > 3)
+    // translate SCAN_MODE_802_15_4, SCAN_MODE_802_11, SCAN_MODE_BLE to 0..2
+    mode -= 1;
+    if (mode < 0 || mode > 2)
         return -1;
     if (freq < SCAN_START_FREQ || freq > SCAN_END_FREQ)
         return -1;
-    return freq_to_channel_map[freq - SCAN_START_FREQ][mode - 1];
+    return freq_to_channel_map[freq - SCAN_START_FREQ][mode];
 }
 
 #pragma endregion Radio Scanner
 
-#pragma region UI Functions
+#pragma region UI Functions - rendering
 // --------------------------------------------------------------------------
-// UI Functions
+// UI Functions - rendering
 // --------------------------------------------------------------------------
 
 /**
@@ -1218,7 +1239,7 @@ void check_power_on_sequence(void)
  * @param x The x-coordinate for the battery icon. Use -1 for right aligned.
  * @param y The y-coordinate for the battery icon.
  */
-void render_battery(int x, int y)
+void render_battery_icon(int x, int y)
 {
     int h = 7;
     // the battery
@@ -1228,6 +1249,40 @@ void render_battery(int x, int y)
     draw_filled_bar(x, y, wm, h, current_bat_status.level, 8, false);
     // tip of the battery
     draw_box(x + wm, y+2, 2, h-4, false, true);
+}
+
+
+/**
+ * @brief Measure the battery and render the battery status, top right on the screen. 
+ */
+void render_battery(void)
+{
+    char buf[10];
+    // Battery Update (rarely)
+    static int batt_ctr = 0;
+    if (batt_ctr == 0)
+    {
+        bat_measure_update();
+    }
+    if (batt_ctr++ > 60)
+    {
+        batt_ctr = 0;
+    }
+
+    if (current_bat_status.is_charging)
+    {
+        draw_text_buf_right(0, "CHRG");
+    }
+    else
+    {
+        // text
+        // int pct = (current_bat_status.level * 100) / 8;
+        // sprintf(buf, "%d%%", pct);
+        // draw_text_buf_right(0, buf);
+
+        // icon
+        render_battery_icon(-1, 0);
+    }
 }
 
 
@@ -1296,7 +1351,7 @@ void render_scanner_waterfall(void)
  * @brief Render the channel markers
  * 
  * To be called only by `render_scanner()`
- * @param mode 1 = IEEE 802.15.4, 2 = WiFi 802.11b/g/n, 3 = BLE
+ * @param mode SCAN_MODE_802_15_4, SCAN_MODE_802_11, SCAN_MODE_BLE
  **/
 void render_scanner_channels(int mode) 
 {
@@ -1413,10 +1468,20 @@ void render_scanner(void)
 
     process_scanner_waterfall();
 
-    if (scanner_selection == 0)
-        render_scanner_waterfall();
-    else
-        render_scanner_channels(scanner_selection); // for now, same waterfall for all modes
+    switch (scanner_selection)
+    {
+        case SCAN_MODE_FREQUENCY:
+            render_scanner_waterfall();
+            break;
+        case SCAN_MODE_802_15_4:
+        case SCAN_MODE_802_11:
+        case SCAN_MODE_BLE:
+            render_scanner_channels(scanner_selection);
+            break;
+        default:
+            draw_text_buf_centered(0, "UNKNOWN MODE");
+            break;
+    }
 
     // Info Text
     char buf[40];
@@ -1438,32 +1503,11 @@ void render_scanner(void)
         draw_text_buf_right(56, buf);
     }
 
-    // Battery Update (rarely)
-    static int batt_ctr = 0;
-    if (batt_ctr++ > 60)
-    {
-        bat_measure_update();
-        batt_ctr = 0;
-    }
-
-    if (current_bat_status.is_charging)
-    {
-        draw_text_buf_right(0, "CHRG");
-    }
-    else
-    {
-        // text
-        // int pct = (current_bat_status.level * 100) / 8;
-        // sprintf(buf, "%d%%", pct);
-        // draw_text_buf_right(0, buf);
-
-        // icon
-        render_battery(-1, 0);
-    }
+    // Battery Status
+    render_battery();
 
     lcd_flush();
 }
-
 
 /**
  * @brief Render the info screen
@@ -1524,7 +1568,7 @@ void render_menu_item(int line)
         return;
     }
 
-    if (line > MENU_ITEMS - 1)
+    if (line > NR_MENU_ITEMS - 1)
         return; // out of range
     
     int x = MENU_LEFT_X;
@@ -1533,7 +1577,7 @@ void render_menu_item(int line)
     {
         draw_char_buf(x - 10, y, 0x7F); // '►' character
     }
-    const char *text = menu_items[line];
+    const char *text = menu_item_names[line];
     draw_text_buf(x, y, text);
 }
 
@@ -1560,10 +1604,10 @@ void render_menu(void)
     draw_text_buf(MENU_LEFT_X, y, buf);
 
     int x = MENU_LEFT_X + ((strlen(buf) + 1) * 6); // N chars width + 2 chars space
-    render_battery(x, y);
+    render_battery_icon(x, y);
 
     // Menu Items
-    for (int line = 0; line < MENU_ITEMS; line++)
+    for (int line = 0; line < NR_MENU_ITEMS; line++)
     {
         render_menu_item(line);
     }
@@ -1602,7 +1646,138 @@ void render_goto_dfu(void)
     NVIC_SystemReset(); // This function does not return
 }
 
-#pragma endregion UI Functions
+#pragma endregion UI Functions - rendering
+
+#pragma region UI Functions - interacting
+// --------------------------------------------------------------------------
+// UI Functions - interacting
+// --------------------------------------------------------------------------
+
+
+/**
+ * @brief handles the scanner interactions
+ */
+void handle_scanner(void)
+{
+    scan_band();
+    render_scanner();
+
+    // Interaction
+    if (btn_mid(0))
+    {
+        current_state = STATE_MENU;
+        menu_selection = MENU_BACK; // Reset selection on entry
+    }
+    if (btn_left(false)) scanner_selection--;
+    if (btn_right(false)) scanner_selection++;
+    // wrap around scanner mode selections
+    if (scanner_selection < 0)
+        scanner_selection = NR_SCANNER_MODES - 1;
+    if (scanner_selection > NR_SCANNER_MODES - 1)
+        scanner_selection = 0;
+
+#ifdef SHOW_FPS_INDICATOR
+    // FPS Counter
+    m_frame_count++;
+    uint32_t now = get_time_ms();
+    if (now - m_last_time >= 1000)
+    {
+        m_fps = m_frame_count;
+        m_frame_count = 0;
+        m_last_time = now;
+    }
+#endif         
+}
+
+/**
+ * @brief Handle the menu interactions
+ **/
+void handle_menu(void)
+{
+    render_menu();
+
+    if (btn_left(false)) menu_selection--;
+    if (btn_right(false)) menu_selection++;
+    // wrap around menu selection
+    if (menu_selection < 0)
+        menu_selection = NR_MENU_ITEMS - 1;
+    if (menu_selection > NR_MENU_ITEMS - 1)
+        menu_selection = 0;
+
+    if (btn_mid(0))
+    {
+        switch (menu_selection)
+        {
+            case MENU_BACK:
+                current_state = STATE_SCANNER;
+                break;
+            case MENU_ABOUT:
+                current_state = STATE_INFO;
+                break;
+            case MENU_SLEEP:
+                render_goto_sleep(); // this halts the program (in a deep sleep mode)
+                break;
+            case MENU_FIRMWARE_UPDATE:
+                render_goto_dfu(); // this exits to a bootloader
+                break;
+#ifndef OLED_TYPE_SH1106
+            case MENU_SETTINGS:
+                current_state = STATE_SETTINGS;
+                break;
+#endif
+            default:
+                // do nothing
+                break;
+        }
+    }
+    nrf_delay_ms(150);
+}
+
+
+/**
+ * @brief Handle the "About" screen interactions
+ */
+void handle_info(void)
+{
+    render_info();
+    // Press any key to go back
+    if (btn_mid(0) || btn_left(false) || btn_right(false))
+    {
+        current_state = STATE_MENU;
+        nrf_delay_ms(150);
+    }
+}
+
+#ifndef OLED_TYPE_SH1106 
+/**
+ * @brief Handles the Settings interactions
+ */
+void handle_settings(void)
+{
+    render_settings();
+
+    if (btn_left(false))
+    {
+        if (m_contrast_level > 0)
+            m_contrast_level--;
+        lcd_set_contrast(m_contrast_level);
+    }
+    if (btn_right(false))
+    {
+        if (m_contrast_level < MAX_CONTRAST)
+            m_contrast_level++;
+        lcd_set_contrast(m_contrast_level);
+    }
+    if (btn_mid(0))
+    {
+        current_state = STATE_MENU;
+        settings_save(); // will check if changes are needed to be persisted
+        nrf_delay_ms(150);
+    }
+}
+#endif
+
+#pragma endregion UI Functions - interacting
 
 #pragma region Main Application
 // --------------------------------------------------------------------------
@@ -1647,111 +1822,26 @@ int main(void)
             // Long press to enter deep sleep from any state
             render_goto_sleep();
         }
-        if (current_state == STATE_SCANNER)
+        switch (current_state)
         {
-            scan_band();
-            render_scanner();
-
-            // Interaction
-            if (btn_mid(0))
-            {
-                current_state = STATE_MENU;
-                menu_selection = 0; // Reset selection on entry
-            }
-            if (btn_left(false)) scanner_selection--;
-            if (btn_right(false)) scanner_selection++;
-            // wrap around scanner mode selections
-            if (scanner_selection < 0)
-                scanner_selection = SCANNER_MODES - 1;
-            if (scanner_selection > SCANNER_MODES - 1)
-                scanner_selection = 0;
-
-#ifdef SHOW_FPS_INDICATOR
-            // FPS Counter
-            m_frame_count++;
-            uint32_t now = get_time_ms();
-            if (now - m_last_time >= 1000)
-            {
-                m_fps = m_frame_count;
-                m_frame_count = 0;
-                m_last_time = now;
-            }
-#endif            
-        }
-        else if (current_state == STATE_MENU)
-        {
-            render_menu();
-
-            if (btn_left(false)) menu_selection--;
-            if (btn_right(false)) menu_selection++;
-            // wrap around menu selection
-            if (menu_selection < 0)
-                menu_selection = MENU_ITEMS - 1;
-            if (menu_selection > MENU_ITEMS - 1)
-                menu_selection = 0;
-        
-            if (btn_mid(0))
-            {
-                if (menu_selection == 0)
-                {
-                    current_state = STATE_SCANNER;
-                }
-                else if (menu_selection == 1)
-                {
-                    current_state = STATE_INFO;
-                }
-                else if (menu_selection == 2)
-                {
-                    render_goto_sleep();
-                }
-                else if (menu_selection == 3)
-                {
-                    render_goto_dfu();
-                }
-#ifndef OLED_TYPE_SH1106
-                else if (menu_selection == 4)
-                {
-                    current_state = STATE_SETTINGS;
-                }
-#endif                
-            }
-            nrf_delay_ms(150);
-        }
-        else if (current_state == STATE_INFO)
-        {
-            render_info();
-            // Press any key to go back
-            if (btn_mid(0) || btn_left(false) || btn_right(false))
-            {
-                current_state = STATE_MENU;
-                nrf_delay_ms(150);
-            }
-        }
+            case STATE_SCANNER:
+                handle_scanner();
+                break;
+            case STATE_MENU:
+                handle_menu();
+                break;
+            case STATE_INFO:
+                handle_info();
+                break;
 #ifndef OLED_TYPE_SH1106        
-        else if (current_state == STATE_SETTINGS)
-        {
-            render_settings();
-
-            if (btn_left(false))
-            {
-                if (m_contrast_level > 0)
-                    m_contrast_level--;
-                lcd_set_contrast(m_contrast_level);
-            }
-            if (btn_right(false))
-            {
-                if (m_contrast_level < MAX_CONTRAST)
-                    m_contrast_level++;
-                lcd_set_contrast(m_contrast_level);
-            }
-            if (btn_mid(0))
-            {
-                current_state = STATE_MENU;
-                settings_save(); // will check if changes are needed to be persisted
-                nrf_delay_ms(150);
-            }
-        }
+            case STATE_SETTINGS:
+                handle_settings();
+                break;
 #endif
+            default:
+                current_state = STATE_SCANNER;
+                break;
+        }
     }
 }
 

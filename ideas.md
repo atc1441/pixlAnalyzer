@@ -9,7 +9,7 @@ Right now it only measures RSSI for spectrum analysis, on the range of 2400-2487
 
 This functionality can be expanded in several ways:
 
-1. **Signal identification**: Implement decoding for common protocols like Bluetooth Low Energy (BLE), IEEE 802.15.4 (Zigbee, Thread,..), or Wi-Fi. This would allow the device to not only detect signals but also identify the data being transmitted.
+1. **Signal identification**: Implement decoding for common protocols like Bluetooth Low Energy (BLE), IEEE 802.15.4 (Zigbee, Thread,..), or Wi-Fi. This would allow the device to not only detect signals but also identify the data being transmitted. This seems hard to do, as the nrf52832 is tailored for BLE, and nothing else. An aborted tentative to do this is in the "sniffer" branch.
 
 Some shortcomings that can be improved (and have not been done yet):
 
