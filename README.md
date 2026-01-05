@@ -13,7 +13,7 @@ In the screens below you can see its use.
 
 The lines represent the center frequencies, and the dotted lines the BLE advertising channels.
 
-The chip is unfortunately incapable of filtering or even identifying the different protocols (you'd need a SDR for that), so its just a visual aid.
+The chip is unfortunately incapable of filtering or even identifying the different protocols (you'd need an SDR for that), so its just a visual aid.
 
 This repo is made together with this explanation video:(click on it)
 
