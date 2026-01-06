@@ -31,7 +31,8 @@ https://aliexpress.com/item/1005008726926205.html
 2026-01-xx: enhancements
 
 * Button debouncing
-* LCD contrast adjustment made possible via menu, as some LCD screens are too dark or too bright depending on the batch.
+* Settings menu (persisted between boots via flash memory) with:
+  * OLED / LCD contrast adjustment  (some LCD screens are way too dark or too bright depending on the batch).
 * Battery icon rendering in the menu and top right corner.
 * Long press (5 seconds) to enter sleep mode.
 * Channel visualisation: Use the scroll wheel to select waterfall view or channel identification view, to give a better idea what the signals represent. It can show three different channel types: the IEEE 802.15.4 (Zigbee,..), 802.11b/g/n WiFi and BLE channels. See [Frequency range and channels](#frequency-range-and-channels) below.

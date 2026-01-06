@@ -119,17 +119,13 @@ typedef enum {
     MENU_ABOUT,
     MENU_SLEEP,
     MENU_FIRMWARE_UPDATE,
-#ifndef OLED_TYPE_SH1106
     MENU_SETTINGS,
-#endif
     NR_MENU_ITEMS // is not a menu entry, serves as maximum marker
 } menu_item_t;
 
 int menu_selection = 0; // int and not enum because I iterate
 
-#ifndef OLED_TYPE_SH1106
 static uint8_t m_contrast_level = 32;
-#endif
 
 const char *menu_item_names[NR_MENU_ITEMS] =
 {
@@ -137,9 +133,7 @@ const char *menu_item_names[NR_MENU_ITEMS] =
     "About",
     "Sleep",
     "Firmware Update",
-#ifndef OLED_TYPE_SH1106    
     "Settings"
-#endif
 };
 
 typedef enum
@@ -304,6 +298,8 @@ void lcd_write_data_block(const uint8_t *data, int len)
     nrf_gpio_pin_set(PIN_LCD_CS);
 }
 
+void lcd_set_contrast(uint8_t contrast); // forward declaration
+
 void lcd_init(void)
 {
     nrf_gpio_cfg_output(PIN_LCD_SCL);
@@ -322,32 +318,31 @@ void lcd_init(void)
     nrf_delay_ms(100);
 
 #ifdef OLED_TYPE_SH1106
-    lcd_write_cmd(0xAE);
+    lcd_write_cmd(0xAE);  // Display off
     lcd_write_cmd(0x00 | (LCD_START_COL & 0x0F));
     lcd_write_cmd(0x10 | (LCD_START_COL >> 4));
-    lcd_write_cmd(0x40);
-    lcd_write_cmd(0xB0);
-    lcd_write_cmd(0x81);
-    lcd_write_cmd(0xCF);
-    lcd_write_cmd(0xA1);
-    lcd_write_cmd(0xA6);
-    lcd_write_cmd(0xA8);
-    lcd_write_cmd(0x3F);
-    lcd_write_cmd(0xAD);
-    lcd_write_cmd(0x8B);
-    lcd_write_cmd(0x33);
-    lcd_write_cmd(0xC8);
-    lcd_write_cmd(0xD3);
-    lcd_write_cmd(0x00);
-    lcd_write_cmd(0xD5);
-    lcd_write_cmd(0x80);
-    lcd_write_cmd(0xD9);
-    lcd_write_cmd(0x1F);
-    lcd_write_cmd(0xDA);
-    lcd_write_cmd(0x12);
-    lcd_write_cmd(0xDB);
-    lcd_write_cmd(0x40);
-    lcd_write_cmd(0xAF);
+    lcd_write_cmd(0x40); // Set display start line to 0
+    lcd_write_cmd(0xB0); // Set page address to 0
+    lcd_set_contrast(m_contrast_level);
+    lcd_write_cmd(0xA1); // Set segment re-map (A0/A1)
+    lcd_write_cmd(0xA6); // Set display mode (normal/inverse)
+    lcd_write_cmd(0xA8); // Set multiplex ratio
+    lcd_write_cmd(0x3F); // Multiplex ratio value
+    lcd_write_cmd(0xAD); // Set master configuration
+    lcd_write_cmd(0x8B); // Master configuration value
+    lcd_write_cmd(0x33); // Set internal VPP regulator
+    lcd_write_cmd(0xC8); // Set COM output scan direction
+    lcd_write_cmd(0xD3); // Set display offset
+    lcd_write_cmd(0x00); // Display offset value
+    lcd_write_cmd(0xD5); // Set display clock divide ratio/oscillator frequency
+    lcd_write_cmd(0x80); // Display clock divide ratio/oscillator frequency value
+    lcd_write_cmd(0xD9); // Set pre-charge period
+    lcd_write_cmd(0x1F); // Pre-charge period value
+    lcd_write_cmd(0xDA); // Set COM pins hardware configuration
+    lcd_write_cmd(0x12); // COM pins hardware configuration value
+    lcd_write_cmd(0xDB); // Set VCOMH deselect level
+    lcd_write_cmd(0x40); // VCOMH deselect level value
+    lcd_write_cmd(0xAF); // Display off
 #else
     lcd_write_cmd(0xE2); // 1 1 1 0 1 1 1 0, Reset
     nrf_delay_ms(10);    // sleep 10 ms
@@ -355,8 +350,7 @@ void lcd_init(void)
     lcd_write_cmd(0xA0); // 1 0 1 0 0 0 0 0, ADC Select (Segment Driver Direction Select): normal
     lcd_write_cmd(0xC8); // 1 1 0 0 1 0 0 0, Common Output Mode Select: reverse
     lcd_write_cmd(0x23); // 0 0 1 0 0 0 1 1, Voltage Regulator Resistor Ratio Set: 3 (0..7)
-    lcd_write_cmd(0x81); // 1 0 0 0 0 0 0 1, Electronic Volume Mode Set (Contrast setting)
-    lcd_write_cmd(m_contrast_level); // Electronic Volume Register Set (Contrast value): (0..63)
+    lcd_set_contrast(m_contrast_level);
     lcd_write_cmd(0x2F); // 0 0 1 0 1 1 1 1, Power Control Set: all on
     lcd_write_cmd(0xB0); // 1 0 1 1 0 0 0 0, Set Page Address: page 0
     lcd_write_cmd(0xA6); // 1 0 1 0 0 1 1 0, Display Normal / Inverse: normal
@@ -390,12 +384,17 @@ void lcd_flush(void)
     }
 }
 
-#define MAX_CONTRAST 63
-#ifndef OLED_TYPE_SH1106
+#ifdef OLED_TYPE_SH1106
 void lcd_set_contrast(uint8_t contrast)
 {
-    lcd_write_cmd(0x81);
-    lcd_write_cmd(contrast & 0x3F);
+    lcd_write_cmd(0x81);  // Set contrast
+    lcd_write_cmd((contrast & 0x3F) << 2);  // Contrast value (0..255, I remap it from 0..63)
+}
+#else
+void lcd_set_contrast(uint8_t contrast)
+{
+    lcd_write_cmd(0x81);  // Electronic Volume Mode Set (Contrast setting)
+    lcd_write_cmd(contrast & 0x3F);  // Electronic Volume Register Set (Contrast value): (0..63)
 }
 #endif
 
@@ -409,7 +408,7 @@ void lcd_set_contrast(uint8_t contrast)
 // --------------------------------------------------------------------------
 
 typedef struct {
-    uint8_t lcd_contrast : 6; // 0..63
+    uint8_t lcd_contrast : 6; // 0..63, used for both OLED and LCD
     int spare: 22; // spare bits to make it 32 bits total
     uint8_t check: 4; // simple check
 } settings_data_t; // please keep this exactly 32 bits. Bigger is possible, but requires more complex handling below.
@@ -418,8 +417,19 @@ _Static_assert(sizeof(settings_data_t) == 4, "settings_data_t must be exactly 32
 
 static settings_data_t m_settings_data;
 
+#define MAX_CONTRAST 63
+
+#ifdef OLED_TYPE_SH1106
+#define DEFAULT_CONTRAST 32
+#define MIN_CONTRAST 0
+#else
+#define DEFAULT_CONTRAST 32
+// 16 is too low, you'll see nothing on ST7565
+#define MIN_CONTRAST 16
+#endif
+
 static const settings_data_t def_settings_data = {
-    .lcd_contrast = 32,
+    .lcd_contrast = DEFAULT_CONTRAST,
     .spare = 0,
     .check = 0x0A
 };
@@ -431,8 +441,8 @@ static void validate_settings() {
     if (m_settings_data.lcd_contrast > MAX_CONTRAST) {
         m_settings_data.lcd_contrast = MAX_CONTRAST;
     }
-    if (m_settings_data.lcd_contrast <  16) {
-        m_settings_data.lcd_contrast = 16; // 16 is too low, you'll see nothing
+    if (m_settings_data.lcd_contrast < MIN_CONTRAST) {
+        m_settings_data.lcd_contrast = MIN_CONTRAST; 
     }
     if (m_settings_data.check != 0x0A) {
         // invalid data, reset to defaults
@@ -454,22 +464,20 @@ int32_t settings_init() {
         memcpy(&m_settings_data, &def_settings_data, sizeof(settings_data_t));
     }
 
-#ifndef OLED_TYPE_SH1106
     m_contrast_level = m_settings_data.lcd_contrast;
-#endif
+
     return 0;
 }
 
 int32_t settings_save() {
     bool do_save = false;
-#ifndef OLED_TYPE_SH1106
+
     if (m_contrast_level != m_settings_data.lcd_contrast)
     {
         // save new contrast setting
         m_settings_data.lcd_contrast = m_contrast_level;
         do_save = true;                 
     }
-#endif
 
     if (!do_save)
         return 0; // nothing to save
@@ -1531,7 +1539,6 @@ void render_info(void)
     lcd_flush();
 }
 
-#ifndef OLED_TYPE_SH1106
 /**
  * @brief Render the settings screen.
  * For now, only the LCD contrast
@@ -1548,7 +1555,6 @@ void render_settings(void)
 
     lcd_flush();
 }
-#endif
 
 // The left alignment column for menu items
 #define MENU_LEFT_X 25
@@ -1720,11 +1726,9 @@ void handle_menu(void)
             case MENU_FIRMWARE_UPDATE:
                 render_goto_dfu(); // this exits to a bootloader
                 break;
-#ifndef OLED_TYPE_SH1106
             case MENU_SETTINGS:
                 current_state = STATE_SETTINGS;
                 break;
-#endif
             default:
                 // do nothing
                 break;
@@ -1748,7 +1752,6 @@ void handle_info(void)
     }
 }
 
-#ifndef OLED_TYPE_SH1106 
 /**
  * @brief Handles the Settings interactions
  */
@@ -1758,7 +1761,7 @@ void handle_settings(void)
 
     if (btn_left(false))
     {
-        if (m_contrast_level > 0)
+        if (m_contrast_level > MIN_CONTRAST)
             m_contrast_level--;
         lcd_set_contrast(m_contrast_level);
     }
@@ -1775,7 +1778,6 @@ void handle_settings(void)
         nrf_delay_ms(150);
     }
 }
-#endif
 
 #pragma endregion UI Functions - interacting
 
@@ -1833,11 +1835,9 @@ int main(void)
             case STATE_INFO:
                 handle_info();
                 break;
-#ifndef OLED_TYPE_SH1106        
             case STATE_SETTINGS:
                 handle_settings();
                 break;
-#endif
             default:
                 current_state = STATE_SCANNER;
                 break;
