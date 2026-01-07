@@ -14,6 +14,7 @@
 #include "nrf_delay.h"
 #include "nrf_gpio.h"
 #include "nrf_saadc.h"
+#include "nrf_pwm.h"
 #include "boards.h"
 
 #pragma region Configuration & Pin Definitions
@@ -38,6 +39,7 @@
 #define PIN_LCD_CS 27
 #define PIN_LCD_DC 28
 #define PIN_LCD_RST 29
+// Backlight Pin for LCD
 #define PIN_LCD_BL 30
 
 // Button & Input Pins
@@ -67,6 +69,19 @@
 #else
 #define LCD_START_COL 0
 #endif
+
+#define MAX_CONTRAST 63
+#ifdef OLED_TYPE_SH1106
+#define DEFAULT_CONTRAST 32
+#define MIN_CONTRAST 0
+#else
+#define DEFAULT_CONTRAST 32
+// 16 is too low, you'll see nothing on ST7565
+#define MIN_CONTRAST 16
+#define MIN_BACKLIGHT 0
+#define MAX_BACKLIGHT 10
+#endif
+#define DEFAULT_BACKLIGHT 10
 
 #pragma endregion Configuration & Pin Definitions
 
@@ -125,8 +140,6 @@ typedef enum {
 
 int menu_selection = 0; // int and not enum because I iterate
 
-static uint8_t m_contrast_level = 32;
-
 const char *menu_item_names[NR_MENU_ITEMS] =
 {
     "Back",
@@ -135,6 +148,32 @@ const char *menu_item_names[NR_MENU_ITEMS] =
     "Firmware Update",
     "Settings"
 };
+
+static uint8_t m_contrast_level = DEFAULT_CONTRAST; // This is used for both LCD and OLED
+#ifndef OLED_TYPE_SH1106
+static uint8_t m_backlight_level = DEFAULT_BACKLIGHT; // Default backlight level for LCD
+#endif
+
+typedef enum {
+    SETTINGS_BACK = 0,
+    SETTINGS_CONTRAST,
+#ifndef OLED_TYPE_SH1106
+    SETTINGS_BACKLIGHT,
+#endif    
+    NR_SETTINGS_ITEMS // is not a menu entry, serves as maximum marker
+} settings_item_t;
+
+int settings_selection = 0; // int and not enum because I iterate
+
+const char *settings_item_names[NR_SETTINGS_ITEMS] =
+{
+    "Back",
+    "Contrast",
+#ifndef OLED_TYPE_SH1106
+    "Backlight"
+#endif
+};
+
 
 typedef enum
 {
@@ -260,6 +299,95 @@ const char font5x7[FONT_END - FONT_START + 1][5] = {
 
 #pragma endregion Global Variables & Fonts
 
+#pragma region LCD Backlight driver
+#ifndef OLED_TYPE_SH1106
+// --------------------------------------------------------------------------
+// LCD Backlight driver
+// --------------------------------------------------------------------------
+
+// forward declarations
+static ret_code_t pwm_init(void);
+static ret_code_t pwm_uninit(void);
+
+//5 msec (200Hz), 1MHz clock
+#define MY_PWM_COUNTERTOP 5000
+static int16_t m_pwm_seq[1] = {MY_PWM_COUNTERTOP}; // initial duty cycle 1000%
+
+/**
+ * @brief Set the backlight level object
+ * 
+ * @param value Backlight level MIN_BACKLIGHT..MAX_BACKLIGHT
+ */
+void lcd_set_backlight(uint8_t value) 
+{
+    if (value <= MIN_BACKLIGHT) 
+    {
+        value = MIN_BACKLIGHT;
+    }
+    if (value > MAX_BACKLIGHT)
+    {
+        value = MAX_BACKLIGHT;
+    }
+    // set backlight level (0..MAX_BACKLIGHT)
+    if (value == 0)
+    {
+        pwm_uninit();
+        nrf_gpio_pin_clear(PIN_LCD_BL);
+    } 
+    // else if (value == MAX_BACKLIGHT)
+    // {
+    //     pwm_uninit();
+    //     nrf_gpio_pin_set(PIN_LCD_BL);        
+    // } 
+    // else
+    {
+        m_pwm_seq[0] = (1 << 15) | ((MY_PWM_COUNTERTOP * value) / MAX_BACKLIGHT);
+        if (!NRF_PWM0->ENABLE)
+        {
+            // Not started yet? start it
+            pwm_init();
+        }
+        else
+        {
+            // load the new setting from RAM
+            NRF_PWM0->TASKS_SEQSTART[0] = 1;
+        }
+    }
+}
+
+static ret_code_t pwm_init(void) 
+{
+    ret_code_t err_code;
+    /* 1-channel PWM, 200Hz, output on DK LED pins. */
+    NRF_PWM0->PSEL.OUT[0] = PIN_LCD_BL;
+    NRF_PWM0->ENABLE      = 1;  // early on, reduces flicker    
+    NRF_PWM0->MODE        = (PWM_MODE_UPDOWN_Up << PWM_MODE_UPDOWN_Pos);
+    NRF_PWM0->PRESCALER   = (PWM_PRESCALER_PRESCALER_DIV_16 << PWM_PRESCALER_PRESCALER_Pos);  // 1Mhz clock
+    NRF_PWM0->COUNTERTOP  = (MY_PWM_COUNTERTOP << PWM_COUNTERTOP_COUNTERTOP_Pos);
+    NRF_PWM0->LOOP        = (PWM_LOOP_CNT_Disabled << PWM_LOOP_CNT_Pos);
+    NRF_PWM0->DECODER     = (PWM_DECODER_LOAD_Common << PWM_DECODER_LOAD_Pos) | 
+                            (PWM_DECODER_MODE_RefreshCount << PWM_DECODER_MODE_Pos);
+    NRF_PWM0->SEQ[0].PTR  = (uint32_t)&m_pwm_seq[0];
+    NRF_PWM0->SEQ[0].CNT  = ((sizeof(m_pwm_seq) / sizeof(uint16_t)) << PWM_SEQ_CNT_CNT_Pos);
+    NRF_PWM0->SEQ[0].REFRESH  = 0; // update at every loop
+    NRF_PWM0->SEQ[0].ENDDELAY = 0;
+    NRF_PWM0->SHORTS      = 0;
+    NRF_PWM0->TASKS_SEQSTART[0] = 1;
+
+    return NRF_SUCCESS;
+}
+
+static ret_code_t pwm_uninit(void) 
+{
+    NRF_PWM0->TASKS_STOP = 1;
+    NRF_PWM0->ENABLE = (PWM_ENABLE_ENABLE_Disabled << PWM_ENABLE_ENABLE_Pos);
+    nrf_gpio_pin_clear(PIN_LCD_BL);
+    return NRF_SUCCESS;
+}
+
+#endif
+#pragma endregion LCD Backlight driver
+
 #pragma region Low-Level Display Driver
 // --------------------------------------------------------------------------
 // Low-Level Display Driver (OLED and LCD SPI communication)
@@ -344,6 +472,9 @@ void lcd_init(void)
     lcd_write_cmd(0x40); // VCOMH deselect level value
     lcd_write_cmd(0xAF); // Display off
 #else
+
+    lcd_set_backlight(m_backlight_level);  // This calls pwm_init()
+
     lcd_write_cmd(0xE2); // 1 1 1 0 1 1 1 0, Reset
     nrf_delay_ms(10);    // sleep 10 ms
     lcd_write_cmd(0xA2); // 1 0 1 0 0 0 1 0, LCD Bias Set: 1/9 bias ratio
@@ -362,6 +493,9 @@ void lcd_uninit(void)
 {
 #ifdef OLED_TYPE_SH1106
     lcd_write_cmd(0xAE);
+#else
+    lcd_write_cmd(0xAE);
+    pwm_uninit();
 #endif
     nrf_gpio_pin_clear(PIN_LCD_BL);
     nrf_delay_ms(100);
@@ -397,7 +531,6 @@ void lcd_set_contrast(uint8_t contrast)
     lcd_write_cmd(contrast & 0x3F);  // Electronic Volume Register Set (Contrast value): (0..63)
 }
 #endif
-
 #pragma endregion Low-Level Display Driver
 
 #pragma region Settings
@@ -408,8 +541,10 @@ void lcd_set_contrast(uint8_t contrast)
 // --------------------------------------------------------------------------
 
 typedef struct {
-    uint8_t lcd_contrast : 6; // 0..63, used for both OLED and LCD
-    int spare: 22; // spare bits to make it 32 bits total
+    uint8_t lcd_contrast : 6; // 0..63 (MAX_CONTRAST), used for both OLED and LCD
+    int spare1: 2;
+    uint8_t lcd_backlight : 4; // 0..10 (MAX_BACKLIGHT), used for LCD backlight level
+    int spare2: 16; // spare bits to make it 32 bits total
     uint8_t check: 4; // simple check
 } settings_data_t; // please keep this exactly 32 bits. Bigger is possible, but requires more complex handling below.
 
@@ -417,20 +552,11 @@ _Static_assert(sizeof(settings_data_t) == 4, "settings_data_t must be exactly 32
 
 static settings_data_t m_settings_data;
 
-#define MAX_CONTRAST 63
-
-#ifdef OLED_TYPE_SH1106
-#define DEFAULT_CONTRAST 32
-#define MIN_CONTRAST 0
-#else
-#define DEFAULT_CONTRAST 32
-// 16 is too low, you'll see nothing on ST7565
-#define MIN_CONTRAST 16
-#endif
-
 static const settings_data_t def_settings_data = {
     .lcd_contrast = DEFAULT_CONTRAST,
-    .spare = 0,
+    .lcd_backlight = DEFAULT_BACKLIGHT,
+    .spare1 = 0,
+    .spare2 = 0,
     .check = 0x0A
 };
 
@@ -444,6 +570,14 @@ static void validate_settings() {
     if (m_settings_data.lcd_contrast < MIN_CONTRAST) {
         m_settings_data.lcd_contrast = MIN_CONTRAST; 
     }
+#ifndef OLED_TYPE_SH1106    
+    if (m_settings_data.lcd_backlight > MAX_BACKLIGHT) {
+        m_settings_data.lcd_backlight = MAX_BACKLIGHT;
+    }
+    if (m_settings_data.lcd_backlight < MIN_BACKLIGHT) {
+        m_settings_data.lcd_backlight = MIN_BACKLIGHT; 
+    }
+#endif
     if (m_settings_data.check != 0x0A) {
         // invalid data, reset to defaults
         memcpy(&m_settings_data, &def_settings_data, sizeof(settings_data_t));
@@ -465,6 +599,9 @@ int32_t settings_init() {
     }
 
     m_contrast_level = m_settings_data.lcd_contrast;
+#ifndef OLED_TYPE_SH1106    
+    m_backlight_level = m_settings_data.lcd_backlight;
+#endif
 
     return 0;
 }
@@ -478,7 +615,14 @@ int32_t settings_save() {
         m_settings_data.lcd_contrast = m_contrast_level;
         do_save = true;                 
     }
-
+#ifndef OLED_TYPE_SH1106
+    if (m_backlight_level != m_settings_data.lcd_backlight)
+    {
+        // save new backlight setting
+        m_settings_data.lcd_backlight = m_backlight_level;
+        do_save = true;                 
+    }
+#endif
     if (!do_save)
         return 0; // nothing to save
 
@@ -1539,19 +1683,95 @@ void render_info(void)
     lcd_flush();
 }
 
+// The left alignment column for settings items
+#define SETTINGS_LEFT_X 25
+
+/**
+ * @brief Render a single settings item line.
+ * 
+ * @param line Line number to render. -1 for header, 0 for "back" (no value to show)
+ * @param active if that settings item is the active one
+ * @param value the value to show for that settings item
+ * @param max_value the maximum value for that settings item
+ **/
+void render_settings_item(int line, bool active, uint8_t value, int max_value)
+{
+    if (line < 0) 
+    {
+        // this is the header
+        draw_text_buf_centered(3, "SETTINGS");
+        return;
+    }
+
+    if (line > NR_SETTINGS_ITEMS - 1)
+        return; // out of range
+    
+    int x = SETTINGS_LEFT_X;
+    int y = 12;
+    bool has_value = true;
+    if (line == 0)
+    {
+        // this is the "back" item
+        has_value = false;
+        active = false; // cannot be active        
+    } 
+    else
+    {
+        y = 2 + (line * 20);
+    }
+
+    int slider_y = y + 10;
+    if (line == settings_selection)
+    {
+        if (active)
+            draw_char_buf(x - 4, slider_y, 0x7F); // '►' character
+        else
+            draw_char_buf(x - 10, y, 0x7F); // '►' character
+    }
+    const char *text = settings_item_names[line];
+    if (has_value == false)
+    {
+        draw_text_buf(x, y, text);
+        return;
+    }
+    char buf[40];
+    sprintf(buf, "%s: %d", text, value);
+    draw_text_buf(x, y, buf);
+    draw_filled_bar(x + 6, slider_y, MAX_CONTRAST + 2, 8, value, max_value, false);  // MAX_CONTRAST width so all have the same width
+}
+
 /**
  * @brief Render the settings screen.
- * For now, only the LCD contrast
+ * 
+ * @param setting_selected The currently selected setting item
  **/
-void render_settings(void)
+void render_settings(bool setting_selected)
 {
     memset(m_frame_buffer, 0, 1024);
 
-    char buf[30];
-    sprintf(buf, "Contrast: %d", m_contrast_level);
-    draw_text_buf_centered(20, buf);
+    draw_boundingbox(0);
 
-    draw_filled_bar(-1, 30, MAX_CONTRAST + 2, 8, m_contrast_level, MAX_CONTRAST, false);
+    render_settings_item(-1, false, 0, 0); // header
+
+    for (int line = 0; line < NR_SETTINGS_ITEMS; line++)
+    {
+        switch (line)   
+        {
+            case SETTINGS_BACK:
+                render_settings_item(line, false, 0, 0);
+                break;
+            case SETTINGS_CONTRAST:
+                render_settings_item(line, setting_selected, m_contrast_level, MAX_CONTRAST);
+                break;
+#ifndef OLED_TYPE_SH1106       
+            case SETTINGS_BACKLIGHT:
+                render_settings_item(line, setting_selected, m_backlight_level, MAX_BACKLIGHT);
+                break;
+#endif                
+            default:
+                break;
+        }
+    }    
 
     lcd_flush();
 }
@@ -1752,31 +1972,85 @@ void handle_info(void)
     }
 }
 
+static bool setting_selected = false;
+
 /**
  * @brief Handles the Settings interactions
  */
 void handle_settings(void)
 {
-    render_settings();
+    render_settings(setting_selected);
 
-    if (btn_left(false))
+    if (setting_selected == false)
     {
-        if (m_contrast_level > MIN_CONTRAST)
-            m_contrast_level--;
-        lcd_set_contrast(m_contrast_level);
+        // navigate settings items
+        if (btn_mid(0))
+        {
+            if (settings_selection == SETTINGS_BACK)
+            {
+                current_state = STATE_MENU;
+                settings_save(); // will check if changes are needed to be persisted
+                nrf_delay_ms(150);
+                return;
+            } 
+            else
+            {
+                setting_selected = true;
+            }
+        }
+        if (btn_left(false)) settings_selection--;
+        if (btn_right(false)) settings_selection++;
+        // wrap around menu selection
+        if (settings_selection < 0)
+            settings_selection = NR_SETTINGS_ITEMS - 1;
+        if (settings_selection > NR_SETTINGS_ITEMS - 1)
+            settings_selection = 0;
     }
-    if (btn_right(false))
+    else
     {
-        if (m_contrast_level < MAX_CONTRAST)
-            m_contrast_level++;
-        lcd_set_contrast(m_contrast_level);
+        // in value change mode
+        if (btn_mid(0))
+        {
+            setting_selected = false; // exit value change mode
+            nrf_delay_ms(150);
+        } 
+        else
+        {
+            if (settings_selection == SETTINGS_CONTRAST)
+            {
+                if (btn_left(false))
+                {
+                    if (m_contrast_level > MIN_CONTRAST)
+                        m_contrast_level--;
+                    lcd_set_contrast(m_contrast_level);
+                }
+                if (btn_right(false))
+                {
+                    if (m_contrast_level < MAX_CONTRAST)
+                        m_contrast_level++;
+                    lcd_set_contrast(m_contrast_level);
+                }       
+            }
+#ifndef OLED_TYPE_SH1106     
+            else if (settings_selection == SETTINGS_BACKLIGHT)
+            {
+                if (btn_left(false))
+                {
+                    if (m_backlight_level > MIN_BACKLIGHT)
+                        m_backlight_level--;
+                    lcd_set_backlight(m_backlight_level);
+                }
+                if (btn_right(false))
+                {
+                    if (m_backlight_level < MAX_BACKLIGHT)
+                        m_backlight_level++;
+                    lcd_set_backlight(m_backlight_level);
+                }       
+            }
+#endif
+        }
     }
-    if (btn_mid(0))
-    {
-        current_state = STATE_MENU;
-        settings_save(); // will check if changes are needed to be persisted
-        nrf_delay_ms(150);
-    }
+
 }
 
 #pragma endregion UI Functions - interacting
