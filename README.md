@@ -23,6 +23,9 @@ Find them on Aliexpress as example here:
 
 https://aliexpress.com/item/1005008726926205.html
 
+## Battery
+
+The OLED version has a rather high standby current. If you want to avoid charging too often, use the LCD version.
 
 ## Version history
 
@@ -41,9 +44,11 @@ https://aliexpress.com/item/1005008726926205.html
 ## Flashing
 
 You can flash this firmware fully OTA and go back to the stock Pixl.js firmware as well.
-Navigate to the Pixl.js firmware settings and enter the "Firmware Update" menu
-The device will reboot and show "DFU Update" now use the nRFConnect App to connect to the "Pixl DFU" device showing.
-Select the correct firmware update file "PixlAnalyzerLCD.zip" or "PixlAnalyzerOLED.zip" depending on your device and it will flash and reboot to the new Firmware.
+* Navigate to the Pixl.js firmware settings and enter the "Firmware Update" menu.
+* The device will reboot and show "DFU Update".
+* Now use the nRFConnect App to connect to the "Pixl DFU" device showing.
+* Select the correct firmware update file "PixlAnalyzerLCD.zip" or "PixlAnalyzerOLED.zip" depending on your device,
+* .. and it will flash and reboot to the new Firmware.
 
 To Go back to the Pixl.js firmware you can open the menu by pressing the middle button, then navigate to "Firmware Update" and flash the Stock firmware in the same way again.
 
