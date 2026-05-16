@@ -29,9 +29,7 @@ The OLED version has a rather high standby current. If you want to avoid chargin
 
 ## Version history
 
-2025-12-06: first release
-
-2026-01-xx: enhancements
+2026-01-06: enhancements
 
 * Button debouncing
 * Settings menu (persisted between boots via flash memory) with:
@@ -40,6 +38,8 @@ The OLED version has a rather high standby current. If you want to avoid chargin
 * Battery icon rendering in the menu and top right corner.
 * Long press (5 seconds) to enter sleep mode.
 * Channel visualisation: Use the scroll wheel to select waterfall view or channel identification view, to give a better idea what the signals represent. It can show three different channel types: the IEEE 802.15.4 (Zigbee,..), 802.11b/g/n WiFi and BLE channels. See [Frequency range and channels](#frequency-range-and-channels) below.
+
+2025-12-06: first release
 
 ## Flashing
 
