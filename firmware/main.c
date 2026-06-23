@@ -1,8 +1,8 @@
 /**
  * Single File Spectrum Analyzer
- * Hardware: nRF52, ST7565/SH1106 LCD, Radio
+ * Hardware: nrf52832, ST7565 LCD or SH1106 (CH1116) OLED, Radio, no PMIC
  * Updated: Added DFU Bootloader entry
- */
+ **/
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -14,14 +14,24 @@
 #include "nrf_delay.h"
 #include "nrf_gpio.h"
 #include "nrf_saadc.h"
+#include "nrf_pwm.h"
 #include "boards.h"
 
+#pragma region Configuration & Pin Definitions
 // --------------------------------------------------------------------------
-// CONFIGURATION & PIN DEFINITIONS
+// Configuration & Pin Definitions
 // --------------------------------------------------------------------------
 
 // Select Display Type (Uncomment if SH1106 is used instead of ST7565)
+// This is set by the makefile
 // #define OLED_TYPE_SH1106
+
+#ifdef LCD_TYPE_DEFAULT
+#undef OLED_TYPE_SH1106
+#endif
+
+// debugging only: show FPS indicator
+// #define SHOW_FPS_INDICATOR
 
 // LCD Pins
 #define PIN_LCD_SCL 26
@@ -29,6 +39,7 @@
 #define PIN_LCD_CS 27
 #define PIN_LCD_DC 28
 #define PIN_LCD_RST 29
+// Backlight Pin for LCD
 #define PIN_LCD_BL 30
 
 // Button & Input Pins
@@ -39,6 +50,7 @@
 #define PIN_CHRG_STAT 3
 
 // Spectrum Analyzer Settings
+#define SCAN_BASE_FREQ 2400 // in MHz
 #define SCAN_START_FREQ 0
 #define SCAN_END_FREQ 87
 #define BANDWIDTH (SCAN_END_FREQ - SCAN_START_FREQ + 1)
@@ -47,7 +59,6 @@
 #define DISP_W 128
 #define DISP_H 64
 #define SPECTRUM_H 32
-#define WATERFALL_START 32
 
 // DFU Magic Number (Standard Nordic SDK value)
 #define BOOTLOADER_DFU_START 0xB1
@@ -59,23 +70,47 @@
 #define LCD_START_COL 0
 #endif
 
+#define MAX_CONTRAST 63
+#ifdef OLED_TYPE_SH1106
+#define DEFAULT_CONTRAST 32
+#define MIN_CONTRAST 0
+#else
+#define DEFAULT_CONTRAST 32
+// 16 is too low, you'll see nothing on ST7565
+#define MIN_CONTRAST 16
+#define MIN_BACKLIGHT 0
+#define MAX_BACKLIGHT 10
+#endif
+#define DEFAULT_BACKLIGHT 10
+
+#pragma endregion Configuration & Pin Definitions
+
+#pragma region Global Variables & Fonts
 // --------------------------------------------------------------------------
-// GLOBAL VARIABLES & FONTS
+// Global Variables & Fonts
 // --------------------------------------------------------------------------
 
+// The screen buffer
 static uint8_t m_frame_buffer[1024];
+
+// array with RSSI values for each frequency in the scan range, normally 20..90 (meaning -20dBm .. -90dBm)
 static uint8_t m_rssi_current[BANDWIDTH];
+// array with peak RSSI values for each frequency in the scan range. Both will use gradual falloff.
 static uint8_t m_rssi_peak[BANDWIDTH];
 static float m_rssi_floating[BANDWIDTH];
+
+// array with waterfall data
 static uint8_t m_waterfall_data[DISP_W][4];
 
+#ifdef SHOW_FPS_INDICATOR
 static uint32_t m_frame_count = 0;
 static uint32_t m_fps = 0;
 static uint32_t m_last_time = 0;
+#endif
 
 typedef struct
 {
-    uint8_t level;
+    uint8_t level; // 0..8
     float voltage;
     bool is_charging;
     int16_t raw_adc;
@@ -86,20 +121,276 @@ const float lipo_voltage_map[] = {4.1, 3.98, 3.92, 3.87, 3.8, 3.7, 3.6, 3.5, 3.4
 
 typedef enum
 {
-    STATE_SCANNER,
+    STATE_SCANNER = 0,
     STATE_MENU,
-    STATE_INFO
+    STATE_INFO,
+    STATE_SETTINGS
 } app_state_t;
 
 app_state_t current_state = STATE_SCANNER;
-int menu_selection = 0;
 
+typedef enum {
+    MENU_BACK = 0,
+    MENU_ABOUT,
+    MENU_SLEEP,
+    MENU_FIRMWARE_UPDATE,
+    MENU_SETTINGS,
+    NR_MENU_ITEMS // is not a menu entry, serves as maximum marker
+} menu_item_t;
+
+int menu_selection = 0; // int and not enum because I iterate
+
+const char *menu_item_names[NR_MENU_ITEMS] =
+{
+    "Back",
+    "About",
+    "Sleep",
+    "Firmware Update",
+    "Settings"
+};
+
+static uint8_t m_contrast_level = DEFAULT_CONTRAST; // This is used for both LCD and OLED
+#ifndef OLED_TYPE_SH1106
+static uint8_t m_backlight_level = DEFAULT_BACKLIGHT; // Default backlight level for LCD
+#endif
+
+typedef enum {
+    SETTINGS_BACK = 0,
+    SETTINGS_CONTRAST,
+#ifndef OLED_TYPE_SH1106
+    SETTINGS_BACKLIGHT,
+#endif    
+    NR_SETTINGS_ITEMS // is not a menu entry, serves as maximum marker
+} settings_item_t;
+
+int settings_selection = 0; // int and not enum because I iterate
+
+const char *settings_item_names[NR_SETTINGS_ITEMS] =
+{
+    "Back",
+    "Contrast",
+#ifndef OLED_TYPE_SH1106
+    "Backlight"
+#endif
+};
+
+
+typedef enum
+{
+    SCAN_MODE_FREQUENCY = 0,
+    SCAN_MODE_802_15_4,
+    SCAN_MODE_802_11,
+    SCAN_MODE_BLE,
+    NR_SCANNER_MODES // is not a scanner mode, serves as maximum marker
+} scanner_mode_t;
+
+int scanner_selection = 0; // int and not enum because I iterate
+const char *scanner_mode_names[NR_SCANNER_MODES] =
+{
+    "Freq",
+    "802.15.4",
+    "802.11b/g/n",
+    "BLE",
+};
+
+#define FONT_START 32
+#define FONT_END 127
 // Font 5x7
-const uint8_t font5x7[][5] = {
-    {0, 0, 0, 0, 0}, {0, 0, 95, 0, 0}, {0, 7, 0, 7, 0}, {20, 127, 20, 127, 20}, {36, 42, 127, 42, 18}, {35, 19, 8, 100, 98}, {54, 73, 85, 34, 80}, {0, 5, 3, 0, 0}, {0, 28, 34, 65, 0}, {0, 65, 34, 28, 0}, {20, 8, 62, 8, 20}, {8, 8, 62, 8, 8}, {0, 80, 48, 0, 0}, {8, 8, 8, 8, 8}, {0, 96, 96, 0, 0}, {32, 16, 8, 4, 2}, {62, 81, 73, 69, 62}, {0, 66, 127, 64, 0}, {66, 97, 81, 73, 70}, {33, 65, 69, 75, 49}, {24, 20, 18, 127, 16}, {39, 69, 69, 69, 57}, {60, 74, 73, 73, 48}, {1, 1, 113, 9, 7}, {54, 73, 73, 73, 54}, {6, 73, 73, 41, 30}, {0, 54, 54, 0, 0}, {0, 86, 54, 0, 0}, {8, 20, 34, 65, 0}, {20, 20, 20, 20, 20}, {0, 65, 34, 20, 8}, {2, 1, 81, 9, 6}, {50, 73, 121, 65, 62}, {126, 17, 17, 17, 126}, {127, 73, 73, 73, 54}, {62, 65, 65, 65, 34}, {127, 65, 65, 65, 62}, {127, 73, 73, 73, 65}, {127, 9, 9, 9, 1}, {62, 65, 73, 73, 58}, {127, 8, 8, 8, 127}, {0, 65, 127, 65, 0}, {32, 64, 65, 63, 1}, {127, 8, 20, 34, 65}, {127, 64, 64, 64, 64}, {127, 2, 12, 2, 127}, {127, 4, 8, 16, 127}, {62, 65, 65, 65, 62}, {127, 9, 9, 9, 6}, {62, 65, 81, 33, 94}, {127, 9, 25, 41, 70}, {70, 73, 73, 73, 49}, {1, 1, 127, 1, 1}, {63, 64, 64, 64, 63}, {31, 32, 64, 32, 31}, {63, 64, 56, 64, 63}, {99, 20, 8, 20, 99}, {7, 8, 112, 8, 7}, {97, 81, 73, 69, 67}, {0, 127, 65, 65, 0}, {2, 4, 8, 16, 32}, {0, 65, 65, 127, 0}, {4, 2, 1, 2, 4}, {64, 64, 64, 64, 64}, {0, 1, 2, 4, 0}, {32, 84, 84, 84, 120}, {127, 72, 68, 68, 56}, {56, 68, 68, 68, 32}, {56, 68, 68, 72, 127}, {56, 84, 84, 84, 24}, {8, 126, 9, 1, 2}, {12, 82, 82, 82, 62}, {127, 8, 4, 4, 120}, {0, 68, 125, 64, 0}, {32, 64, 68, 61, 0}, {127, 16, 40, 68, 0}, {0, 65, 127, 64, 0}, {124, 4, 24, 4, 120}, {124, 8, 4, 4, 120}, {56, 68, 68, 68, 56}, {124, 20, 20, 20, 8}, {8, 20, 20, 24, 124}, {124, 8, 4, 4, 8}, {72, 84, 84, 84, 32}, {4, 63, 68, 64, 32}, {60, 64, 64, 32, 124}, {28, 32, 64, 32, 28}, {60, 64, 48, 64, 60}, {68, 40, 16, 40, 68}, {12, 80, 80, 80, 60}, {68, 100, 84, 76, 68}};
+const char font5x7[FONT_END - FONT_START + 1][5] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00}, // ' '
+    {0x00, 0x00, 0x5F, 0x00, 0x00}, // '!'
+    {0x00, 0x07, 0x00, 0x07, 0x00}, // '"'
+    {0x14, 0x7F, 0x14, 0x7F, 0x14}, // '#'
+    {0x24, 0x2A, 0x7F, 0x2A, 0x12}, // '$'
+    {0x23, 0x13, 0x08, 0x64, 0x62}, // '%'
+    {0x36, 0x49, 0x55, 0x22, 0x50}, // '&'
+    {0x00, 0x05, 0x03, 0x00, 0x00}, // '''
+    {0x00, 0x1C, 0x22, 0x41, 0x00}, // '('
+    {0x00, 0x41, 0x22, 0x1C, 0x00}, // ')'
+    {0x14, 0x08, 0x3E, 0x08, 0x14}, // '*'
+    {0x08, 0x08, 0x3E, 0x08, 0x08}, // '+'
+    {0x00, 0x50, 0x30, 0x00, 0x00}, // ','
+    {0x08, 0x08, 0x08, 0x08, 0x08}, // '-'
+    {0x00, 0x60, 0x60, 0x00, 0x00}, // '.'
+    {0x20, 0x10, 0x08, 0x04, 0x02}, // '/'
+    {0x3E, 0x51, 0x49, 0x45, 0x3E}, // '0'
+    {0x00, 0x42, 0x7F, 0x40, 0x00}, // '1'
+    {0x42, 0x61, 0x51, 0x49, 0x46}, // '2'
+    {0x21, 0x41, 0x45, 0x4B, 0x31}, // '3'
+    {0x18, 0x14, 0x12, 0x7F, 0x10}, // '4'
+    {0x27, 0x45, 0x45, 0x45, 0x39}, // '5'
+    {0x3C, 0x4A, 0x49, 0x49, 0x30}, // '6'
+    {0x01, 0x01, 0x71, 0x09, 0x07}, // '7'
+    {0x36, 0x49, 0x49, 0x49, 0x36}, // '8'
+    {0x06, 0x49, 0x49, 0x29, 0x1E}, // '9'
+    {0x00, 0x36, 0x36, 0x00, 0x00}, // ':'
+    {0x00, 0x56, 0x36, 0x00, 0x00}, // ';'
+    {0x08, 0x14, 0x22, 0x41, 0x00}, // '<'
+    {0x14, 0x14, 0x14, 0x14, 0x14}, // '='
+    {0x00, 0x41, 0x22, 0x14, 0x08}, // '>'
+    {0x02, 0x01, 0x51, 0x09, 0x06}, // '?'
+    {0x32, 0x49, 0x79, 0x41, 0x3E}, // '@'
+    {0x7E, 0x11, 0x11, 0x11, 0x7E}, // 'A'
+    {0x7F, 0x49, 0x49, 0x49, 0x36}, // 'B'
+    {0x3E, 0x41, 0x41, 0x41, 0x22}, // 'C'
+    {0x7F, 0x41, 0x41, 0x41, 0x3E}, // 'D'
+    {0x7F, 0x49, 0x49, 0x49, 0x41}, // 'E'
+    {0x7F, 0x09, 0x09, 0x09, 0x01}, // 'F'
+    {0x3E, 0x41, 0x49, 0x49, 0x3A}, // 'G'
+    {0x7F, 0x08, 0x08, 0x08, 0x7F}, // 'H'
+    {0x00, 0x41, 0x7F, 0x41, 0x00}, // 'I'
+    {0x20, 0x40, 0x41, 0x3F, 0x01}, // 'J'
+    {0x7F, 0x08, 0x14, 0x22, 0x41}, // 'K'
+    {0x7F, 0x40, 0x40, 0x40, 0x40}, // 'L'
+    {0x7F, 0x02, 0x0C, 0x02, 0x7F}, // 'M'
+    {0x7F, 0x04, 0x08, 0x10, 0x7F}, // 'N'
+    {0x3E, 0x41, 0x41, 0x41, 0x3E}, // 'O'
+    {0x7F, 0x09, 0x09, 0x09, 0x06}, // 'P'
+    {0x3E, 0x41, 0x51, 0x21, 0x5E}, // 'Q'
+    {0x7F, 0x09, 0x19, 0x29, 0x46}, // 'R'
+    {0x46, 0x49, 0x49, 0x49, 0x31}, // 'S'
+    {0x01, 0x01, 0x7F, 0x01, 0x01}, // 'T'
+    {0x3F, 0x40, 0x40, 0x40, 0x3F}, // 'U'
+    {0x1F, 0x20, 0x40, 0x20, 0x1F}, // 'V'
+    {0x3F, 0x40, 0x38, 0x40, 0x3F}, // 'W'
+    {0x63, 0x14, 0x08, 0x14, 0x63}, // 'X'
+    {0x07, 0x08, 0x70, 0x08, 0x07}, // 'Y'
+    {0x61, 0x51, 0x49, 0x45, 0x43}, // 'Z'
+    {0x00, 0x7F, 0x41, 0x41, 0x00}, // '['
+    {0x02, 0x04, 0x08, 0x10, 0x20}, // '\'
+    {0x00, 0x41, 0x41, 0x7F, 0x00}, // ']'
+    {0x04, 0x02, 0x01, 0x02, 0x04}, // '^'
+    {0x40, 0x40, 0x40, 0x40, 0x40}, // '_'
+    {0x00, 0x01, 0x02, 0x04, 0x00}, // '`'
+    {0x20, 0x54, 0x54, 0x54, 0x78}, // 'a'
+    {0x7F, 0x48, 0x44, 0x44, 0x38}, // 'b'
+    {0x38, 0x44, 0x44, 0x44, 0x20}, // 'c'
+    {0x38, 0x44, 0x44, 0x48, 0x7F}, // 'd'
+    {0x38, 0x54, 0x54, 0x54, 0x18}, // 'e'
+    {0x08, 0x7E, 0x09, 0x01, 0x02}, // 'f'
+    {0x0C, 0x52, 0x52, 0x52, 0x3E}, // 'g'
+    {0x7F, 0x08, 0x04, 0x04, 0x78}, // 'h'
+    {0x00, 0x44, 0x7D, 0x40, 0x00}, // 'i'
+    {0x20, 0x40, 0x44, 0x3D, 0x00}, // 'j'
+    {0x7F, 0x10, 0x28, 0x44, 0x00}, // 'k'
+    {0x00, 0x41, 0x7F, 0x40, 0x00}, // 'l'
+    {0x7C, 0x04, 0x18, 0x04, 0x78}, // 'm'
+    {0x7C, 0x08, 0x04, 0x04, 0x78}, // 'n'
+    {0x38, 0x44, 0x44, 0x44, 0x38}, // 'o'
+    {0x7C, 0x14, 0x14, 0x14, 0x08}, // 'p'
+    {0x08, 0x14, 0x14, 0x18, 0x7C}, // 'q'
+    {0x7C, 0x08, 0x04, 0x04, 0x08}, // 'r'
+    {0x48, 0x54, 0x54, 0x54, 0x20}, // 's'
+    {0x04, 0x3F, 0x44, 0x40, 0x20}, // 't'
+    {0x3C, 0x40, 0x40, 0x20, 0x7C}, // 'u'
+    {0x1C, 0x20, 0x40, 0x20, 0x1C}, // 'v'
+    {0x3C, 0x40, 0x30, 0x40, 0x3C}, // 'w'
+    {0x44, 0x28, 0x10, 0x28, 0x44}, // 'x'
+    {0x0C, 0x50, 0x50, 0x50, 0x3C}, // 'y'
+    {0x44, 0x64, 0x54, 0x4C, 0x44}, // 'z'
+    {0x00, 0x08, 0x36, 0x41, 0x00}, // '{'
+    {0x00, 0x00, 0x7F, 0x00, 0x00}, // '|'
+    {0x00, 0x41, 0x36, 0x08, 0x00}, // '}'
+    {0x10, 0x08, 0x08, 0x10, 0x08}, // '~'
+    {0x00, 0x7F, 0x3E, 0x1C, 0x08}  // '►', as 0x7F
+};
+// I repeat the FONT_END - FONT_START in the definition, as that makes the compiler check the size
 
+
+#pragma endregion Global Variables & Fonts
+
+#pragma region LCD Backlight driver
+#ifndef OLED_TYPE_SH1106
 // --------------------------------------------------------------------------
-// LOW LEVEL LCD DRIVER
+// LCD Backlight driver
+// --------------------------------------------------------------------------
+
+// forward declarations
+static ret_code_t pwm_init(void);
+static ret_code_t pwm_uninit(void);
+
+//5 msec (200Hz), 1MHz clock
+#define MY_PWM_COUNTERTOP 5000
+static int16_t m_pwm_seq[1] = {MY_PWM_COUNTERTOP}; // initial duty cycle 1000%
+
+/**
+ * @brief Set the backlight level object
+ * 
+ * @param value Backlight level MIN_BACKLIGHT..MAX_BACKLIGHT
+ */
+void lcd_set_backlight(uint8_t value) 
+{
+    if (value <= MIN_BACKLIGHT) 
+    {
+        value = MIN_BACKLIGHT;
+    }
+    if (value > MAX_BACKLIGHT)
+    {
+        value = MAX_BACKLIGHT;
+    }
+    // set backlight level (0..MAX_BACKLIGHT)
+    if (value == 0)
+    {
+        pwm_uninit();
+        nrf_gpio_pin_clear(PIN_LCD_BL);
+    } 
+    // else if (value == MAX_BACKLIGHT)
+    // {
+    //     pwm_uninit();
+    //     nrf_gpio_pin_set(PIN_LCD_BL);        
+    // } 
+    // else
+    {
+        m_pwm_seq[0] = (1 << 15) | ((MY_PWM_COUNTERTOP * value) / MAX_BACKLIGHT);
+        if (!NRF_PWM0->ENABLE)
+        {
+            // Not started yet? start it
+            pwm_init();
+        }
+        else
+        {
+            // load the new setting from RAM
+            NRF_PWM0->TASKS_SEQSTART[0] = 1;
+        }
+    }
+}
+
+static ret_code_t pwm_init(void) 
+{
+    ret_code_t err_code;
+    /* 1-channel PWM, 200Hz, output on DK LED pins. */
+    NRF_PWM0->PSEL.OUT[0] = PIN_LCD_BL;
+    NRF_PWM0->ENABLE      = 1;  // early on, reduces flicker    
+    NRF_PWM0->MODE        = (PWM_MODE_UPDOWN_Up << PWM_MODE_UPDOWN_Pos);
+    NRF_PWM0->PRESCALER   = (PWM_PRESCALER_PRESCALER_DIV_16 << PWM_PRESCALER_PRESCALER_Pos);  // 1Mhz clock
+    NRF_PWM0->COUNTERTOP  = (MY_PWM_COUNTERTOP << PWM_COUNTERTOP_COUNTERTOP_Pos);
+    NRF_PWM0->LOOP        = (PWM_LOOP_CNT_Disabled << PWM_LOOP_CNT_Pos);
+    NRF_PWM0->DECODER     = (PWM_DECODER_LOAD_Common << PWM_DECODER_LOAD_Pos) | 
+                            (PWM_DECODER_MODE_RefreshCount << PWM_DECODER_MODE_Pos);
+    NRF_PWM0->SEQ[0].PTR  = (uint32_t)&m_pwm_seq[0];
+    NRF_PWM0->SEQ[0].CNT  = ((sizeof(m_pwm_seq) / sizeof(uint16_t)) << PWM_SEQ_CNT_CNT_Pos);
+    NRF_PWM0->SEQ[0].REFRESH  = 0; // update at every loop
+    NRF_PWM0->SEQ[0].ENDDELAY = 0;
+    NRF_PWM0->SHORTS      = 0;
+    NRF_PWM0->TASKS_SEQSTART[0] = 1;
+
+    return NRF_SUCCESS;
+}
+
+static ret_code_t pwm_uninit(void) 
+{
+    NRF_PWM0->TASKS_STOP = 1;
+    NRF_PWM0->ENABLE = (PWM_ENABLE_ENABLE_Disabled << PWM_ENABLE_ENABLE_Pos);
+    nrf_gpio_pin_clear(PIN_LCD_BL);
+    return NRF_SUCCESS;
+}
+
+#endif
+#pragma endregion LCD Backlight driver
+
+#pragma region Low-Level Display Driver
+// --------------------------------------------------------------------------
+// Low-Level Display Driver (OLED and LCD SPI communication)
 // --------------------------------------------------------------------------
 
 static void lcd_spi_byte(uint8_t data)
@@ -135,6 +426,8 @@ void lcd_write_data_block(const uint8_t *data, int len)
     nrf_gpio_pin_set(PIN_LCD_CS);
 }
 
+void lcd_set_contrast(uint8_t contrast); // forward declaration
+
 void lcd_init(void)
 {
     nrf_gpio_cfg_output(PIN_LCD_SCL);
@@ -153,45 +446,46 @@ void lcd_init(void)
     nrf_delay_ms(100);
 
 #ifdef OLED_TYPE_SH1106
-    lcd_write_cmd(0xAE);
+    lcd_write_cmd(0xAE);  // Display off
     lcd_write_cmd(0x00 | (LCD_START_COL & 0x0F));
     lcd_write_cmd(0x10 | (LCD_START_COL >> 4));
-    lcd_write_cmd(0x40);
-    lcd_write_cmd(0xB0);
-    lcd_write_cmd(0x81);
-    lcd_write_cmd(0xCF);
-    lcd_write_cmd(0xA1);
-    lcd_write_cmd(0xA6);
-    lcd_write_cmd(0xA8);
-    lcd_write_cmd(0x3F);
-    lcd_write_cmd(0xAD);
-    lcd_write_cmd(0x8B);
-    lcd_write_cmd(0x33);
-    lcd_write_cmd(0xC8);
-    lcd_write_cmd(0xD3);
-    lcd_write_cmd(0x00);
-    lcd_write_cmd(0xD5);
-    lcd_write_cmd(0x80);
-    lcd_write_cmd(0xD9);
-    lcd_write_cmd(0x1F);
-    lcd_write_cmd(0xDA);
-    lcd_write_cmd(0x12);
-    lcd_write_cmd(0xDB);
-    lcd_write_cmd(0x40);
-    lcd_write_cmd(0xAF);
+    lcd_write_cmd(0x40); // Set display start line to 0
+    lcd_write_cmd(0xB0); // Set page address to 0
+    lcd_set_contrast(m_contrast_level);
+    lcd_write_cmd(0xA1); // Set segment re-map (A0/A1)
+    lcd_write_cmd(0xA6); // Set display mode (normal/inverse)
+    lcd_write_cmd(0xA8); // Set multiplex ratio
+    lcd_write_cmd(0x3F); // Multiplex ratio value
+    lcd_write_cmd(0xAD); // Set master configuration
+    lcd_write_cmd(0x8B); // Master configuration value
+    lcd_write_cmd(0x33); // Set internal VPP regulator
+    lcd_write_cmd(0xC8); // Set COM output scan direction
+    lcd_write_cmd(0xD3); // Set display offset
+    lcd_write_cmd(0x00); // Display offset value
+    lcd_write_cmd(0xD5); // Set display clock divide ratio/oscillator frequency
+    lcd_write_cmd(0x80); // Display clock divide ratio/oscillator frequency value
+    lcd_write_cmd(0xD9); // Set pre-charge period
+    lcd_write_cmd(0x1F); // Pre-charge period value
+    lcd_write_cmd(0xDA); // Set COM pins hardware configuration
+    lcd_write_cmd(0x12); // COM pins hardware configuration value
+    lcd_write_cmd(0xDB); // Set VCOMH deselect level
+    lcd_write_cmd(0x40); // VCOMH deselect level value
+    lcd_write_cmd(0xAF); // Display off
 #else
-    lcd_write_cmd(0xE2);
-    nrf_delay_ms(10);
-    lcd_write_cmd(0xA2);
-    lcd_write_cmd(0xA0);
-    lcd_write_cmd(0xC8);
-    lcd_write_cmd(0x23);
-    lcd_write_cmd(0x81);
-    lcd_write_cmd(0x32);
-    lcd_write_cmd(0x2F);
-    lcd_write_cmd(0xB0);
-    lcd_write_cmd(0xA6);
-    lcd_write_cmd(0xAF);
+
+    lcd_set_backlight(m_backlight_level);  // This calls pwm_init()
+
+    lcd_write_cmd(0xE2); // 1 1 1 0 1 1 1 0, Reset
+    nrf_delay_ms(10);    // sleep 10 ms
+    lcd_write_cmd(0xA2); // 1 0 1 0 0 0 1 0, LCD Bias Set: 1/9 bias ratio
+    lcd_write_cmd(0xA0); // 1 0 1 0 0 0 0 0, ADC Select (Segment Driver Direction Select): normal
+    lcd_write_cmd(0xC8); // 1 1 0 0 1 0 0 0, Common Output Mode Select: reverse
+    lcd_write_cmd(0x23); // 0 0 1 0 0 0 1 1, Voltage Regulator Resistor Ratio Set: 3 (0..7)
+    lcd_set_contrast(m_contrast_level);
+    lcd_write_cmd(0x2F); // 0 0 1 0 1 1 1 1, Power Control Set: all on
+    lcd_write_cmd(0xB0); // 1 0 1 1 0 0 0 0, Set Page Address: page 0
+    lcd_write_cmd(0xA6); // 1 0 1 0 0 1 1 0, Display Normal / Inverse: normal
+    lcd_write_cmd(0xAF); // 1 0 1 0 1 1 1 1, Display ON
 #endif
 }
 
@@ -199,6 +493,9 @@ void lcd_uninit(void)
 {
 #ifdef OLED_TYPE_SH1106
     lcd_write_cmd(0xAE);
+#else
+    lcd_write_cmd(0xAE);
+    pwm_uninit();
 #endif
     nrf_gpio_pin_clear(PIN_LCD_BL);
     nrf_delay_ms(100);
@@ -221,8 +518,153 @@ void lcd_flush(void)
     }
 }
 
+#ifdef OLED_TYPE_SH1106
+void lcd_set_contrast(uint8_t contrast)
+{
+    lcd_write_cmd(0x81);  // Set contrast
+    lcd_write_cmd((contrast & 0x3F) << 2);  // Contrast value (0..255, I remap it from 0..63)
+}
+#else
+void lcd_set_contrast(uint8_t contrast)
+{
+    lcd_write_cmd(0x81);  // Electronic Volume Mode Set (Contrast setting)
+    lcd_write_cmd(contrast & 0x3F);  // Electronic Volume Register Set (Contrast value): (0..63)
+}
+#endif
+#pragma endregion Low-Level Display Driver
+
+#pragma region Settings
 // --------------------------------------------------------------------------
-// GRAPHIC PRIMITIVES
+// Settings
+// Settings are stored in UICR CUSTOMER register 0 (0x10001080 .. 0x100010FC)
+// This is a poor man's persistance mechanism, as UICR can only be written/erased in 32-bit words
+// --------------------------------------------------------------------------
+
+typedef struct {
+    uint8_t lcd_contrast : 6; // 0..63 (MAX_CONTRAST), used for both OLED and LCD
+    int spare1: 2;
+    uint8_t lcd_backlight : 4; // 0..10 (MAX_BACKLIGHT), used for LCD backlight level
+    int spare2: 16; // spare bits to make it 32 bits total
+    uint8_t check: 4; // simple check
+} settings_data_t; // please keep this exactly 32 bits. Bigger is possible, but requires more complex handling below.
+
+_Static_assert(sizeof(settings_data_t) == 4, "settings_data_t must be exactly 32 bits (4 bytes)");
+
+static settings_data_t m_settings_data;
+
+static const settings_data_t def_settings_data = {
+    .lcd_contrast = DEFAULT_CONTRAST,
+    .lcd_backlight = DEFAULT_BACKLIGHT,
+    .spare1 = 0,
+    .spare2 = 0,
+    .check = 0x0A
+};
+
+int32_t settings_init();
+int32_t settings_save();
+
+static void validate_settings() {
+    if (m_settings_data.lcd_contrast > MAX_CONTRAST) {
+        m_settings_data.lcd_contrast = MAX_CONTRAST;
+    }
+    if (m_settings_data.lcd_contrast < MIN_CONTRAST) {
+        m_settings_data.lcd_contrast = MIN_CONTRAST; 
+    }
+#ifndef OLED_TYPE_SH1106    
+    if (m_settings_data.lcd_backlight > MAX_BACKLIGHT) {
+        m_settings_data.lcd_backlight = MAX_BACKLIGHT;
+    }
+    if (m_settings_data.lcd_backlight < MIN_BACKLIGHT) {
+        m_settings_data.lcd_backlight = MIN_BACKLIGHT; 
+    }
+#endif
+    if (m_settings_data.check != 0x0A) {
+        // invalid data, reset to defaults
+        memcpy(&m_settings_data, &def_settings_data, sizeof(settings_data_t));
+    }
+}
+
+int32_t settings_init() {
+    // Try to read from UICR customer registers
+    // UICR CUSTOMER registers start at address 0x10001080
+    uint32_t *uicr_settings = (uint32_t *)0x10001080;
+    
+    // Check if UICR contains valid data (not 0xFFFFFFFF which is erased state)
+    if (*uicr_settings != 0xFFFFFFFF) {
+        memcpy(&m_settings_data, uicr_settings, sizeof(settings_data_t)); // This handles multi-byte copy correctly
+        validate_settings();
+    } else {
+        // No valid data in UICR, use defaults
+        memcpy(&m_settings_data, &def_settings_data, sizeof(settings_data_t));
+    }
+
+    m_contrast_level = m_settings_data.lcd_contrast;
+#ifndef OLED_TYPE_SH1106    
+    m_backlight_level = m_settings_data.lcd_backlight;
+#endif
+
+    return 0;
+}
+
+int32_t settings_save() {
+    bool do_save = false;
+
+    if (m_contrast_level != m_settings_data.lcd_contrast)
+    {
+        // save new contrast setting
+        m_settings_data.lcd_contrast = m_contrast_level;
+        do_save = true;                 
+    }
+#ifndef OLED_TYPE_SH1106
+    if (m_backlight_level != m_settings_data.lcd_backlight)
+    {
+        // save new backlight setting
+        m_settings_data.lcd_backlight = m_backlight_level;
+        do_save = true;                 
+    }
+#endif
+    if (!do_save)
+        return 0; // nothing to save
+
+    // Enable UICR erase
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Een << NVMC_CONFIG_WEN_Pos;
+    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
+
+    // Erase UICR
+    NRF_NVMC->ERASEUICR = 1;
+    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
+    
+    NRF_NVMC->ERASEUICR = 0; // TODO don't know if this is needed
+    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
+
+    // Enable flash writes
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen << NVMC_CONFIG_WEN_Pos;
+    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}    
+    
+    // Write settings to UICR CUSTOMER[0]
+    uint32_t *uicr_addr = (uint32_t *)0x10001080;
+    uint32_t data_to_write; // TODO: this is a single 32 bit write. This needs to be changed if settings_data_t becomes larger than 32 bits.
+    memcpy(&data_to_write, &m_settings_data, sizeof(uint32_t));
+    *uicr_addr = data_to_write;
+    
+    // Wait for write to complete
+    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
+    
+    // Disable flash writes
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren << NVMC_CONFIG_WEN_Pos;
+    while (NRF_NVMC->READY == NVMC_READY_READY_Busy) {}
+
+    // read back and validate
+    settings_init();
+    
+    return 0;
+}
+
+#pragma endregion Settings
+
+#pragma region Graphic Primitives
+// --------------------------------------------------------------------------
+// Graphic Primitives
 // --------------------------------------------------------------------------
 
 void draw_pixel(int x, int y, bool on)
@@ -262,11 +704,64 @@ void draw_box(int x, int y, int w, int h, bool fill, bool color)
     }
 }
 
-void draw_char_buf(int x, int y, char c)
+
+/**
+ * @brief Draw a bounding box with given offset from the edges
+ * 
+ * @param offset offset from edge (0...DISP_W/2)
+ **/
+void draw_boundingbox(int offset)
 {
-    if (c < 32 || c > 122)
-        c = 32;
-    c -= 32;
+    if (offset < 0) offset = 0;
+    if (offset > DISP_W / 2) offset = DISP_W / 2;
+    draw_box(offset, offset, DISP_W - 2 * offset, DISP_H - 2 * offset, false, true);
+}
+
+
+/**
+ * @brief Draw a filled bar
+ * 
+ * @param x left of bounding box. If < 0, it is centered on screen
+ * @param y top of bounding box
+ * @param w width of bounding box
+ * @param h height of bounding box
+ * @param fill_level fill level
+ * @param fill_max maximum fill level
+ * @param spacer if true, add 1 pixel empty space between border and fill
+ **/
+void draw_filled_bar(int x, int y, int w, int h, int fill_level, int fill_max, bool spacer)
+{
+    if (x < 0)
+        x = (DISP_W - w) / 2;
+    draw_box(x, y, w, h, false, true);
+    
+    // inside fill
+    if (fill_level > 0)
+    {
+        if (fill_level > fill_max)
+            fill_level = fill_max;
+        int offset = 1;
+        if (spacer)
+            offset = 2;
+
+        int wf = (fill_level * (w - 2 * offset)) / fill_max;
+        draw_box(x + offset, y + offset, wf, h - 2 * offset, true, true);
+    }
+}
+
+
+/**
+ * @brief Draw a character on screen
+ * 
+ * @param x x position (left of the character)
+ * @param y y position (top of the character)
+ * @param c the character. Must be within the defined set of the font (see at font definition)
+ **/
+void draw_char_buf(int x, int y,  char c)
+{
+    if (c < FONT_START || c > FONT_END)
+        c = FONT_START;
+    c -= FONT_START;
     for (int i = 0; i < 5; i++)
     {
         uint8_t line = font5x7[(int)c][i];
@@ -278,7 +773,15 @@ void draw_char_buf(int x, int y, char c)
     }
 }
 
-void draw_text_buf(int x, int y, char *str)
+
+/**
+ * @brief Draw a string on screen
+ * 
+ * @param x x position (left of the string)
+ * @param y y position (top of the string)
+ * @param str the string
+ **/
+void draw_text_buf(int x, int y, const char *str)
 {
     while (*str)
     {
@@ -287,9 +790,236 @@ void draw_text_buf(int x, int y, char *str)
     }
 }
 
+
+/** 
+ * @brief Draw a number vertically
+ * 
+ * @param x x position (center of characters)
+ * @param y y position (top of first character)
+ * @param nr number to draw. Only numbers 0..99 will be drawn
+ **/
+void draw_nr_vertical(int x, int y, int nr)
+{
+    if (nr < 0) return;
+    if (nr > 99) nr = 99;
+    x -= 2; // center of character (well, approx)
+    char ch;    
+    if (nr >= 10)
+    {
+        ch = '0' + (nr / 10);
+        draw_char_buf(x, y, ch);
+        y += 8;
+    }
+    ch = '0' + (nr % 10);
+    draw_char_buf(x, y, ch);
+}
+
+/**
+ * @brief draw a string centered on screeen
+ * 
+ * @param y y position (top of the string)
+ * @param str the string
+ **/
+void draw_text_buf_centered(int y, const char *str)
+{
+    int len = strlen(str);
+    if (len == 0) return;
+    int total_width = len * 6; // 5 pixels + 1 pixel space
+    int start_x = (DISP_W - total_width) / 2;
+    draw_text_buf(start_x, y, str);
+}
+
+/**
+ * @brief draw a string left aligned on screeen
+ * 
+ * @param y y position (top of the string)
+ * @param str the string
+ **/
+void draw_text_buf_left(int y, const char *str)
+{
+    draw_text_buf(0, y, str);
+}
+
+/**
+ * @brief draw a string right aligned on screeen
+ * 
+ * @param y y position (top of the string)
+ * @param str the string
+ **/
+void draw_text_buf_right(int y, const char *str)
+{
+    int len = strlen(str);
+    int total_width = (len * 6) - 1; // 5 pixels + 1 pixel space
+    int start_x = (DISP_W - total_width);
+    draw_text_buf(start_x, y, str);
+}
+
+#pragma endregion Graphic Primitives
+
+#pragma region Buttons
 // --------------------------------------------------------------------------
-// HARDWARE / PERIPHERALS
+// Buttons
 // --------------------------------------------------------------------------
+// forward declaration
+uint32_t get_time_ms(void);
+
+/** 
+ * @brief Detect if the mid button is pressed.
+ * If `detection_mode` is 0, it will only return True on the transition from not pressed to pressed (button press event).
+ * If `detection_mode` is 1, it will return True if the button has been held down (but do not detect length).
+ * If `detection_mode` is 2, it will return True if the button has been held down for more than 5 seconds.
+ * If `detection_mode` < 0: reset internal counters
+ * All use debouncing.
+ * 
+ * @param detection_mode 0 to get debounced leading edge only, 1 to get the raw button state, 2 to see if the button is held since a long time (5 seconds)
+ * @return True if button was pressed, False otherwise
+ **/
+bool btn_mid(int detection_mode) 
+{
+    static bool previous_state = false;
+    static bool edge_detected = false;
+    static uint32_t last_press = 0;
+
+    bool raw_state = (nrf_gpio_pin_read(PIN_BTN_MID) == 0); // active low
+
+    if (detection_mode < 0)
+    {
+        // reset internal variables
+        previous_state = raw_state; // this makes sure that next call will not detect edge
+        edge_detected = false;
+        last_press = 0;
+        return false;
+    }
+
+    // debounce logic
+    if (raw_state != previous_state)
+    {        
+        nrf_delay_ms(10); // Debounce delay
+        raw_state = (nrf_gpio_pin_read(PIN_BTN_MID) == 0); // re-read after debounce delay
+        if (raw_state != previous_state)
+        {
+            previous_state = raw_state;
+            if (raw_state && (detection_mode != 1)) // skip edge detection if in raw mode
+            {
+                // button just pressed
+                last_press = get_time_ms(); // store edge time
+                edge_detected = true;
+            }
+        }
+    }
+    if (raw_state) // pressed
+    {
+        if ((detection_mode == 0) && edge_detected) 
+        {
+            edge_detected = false; // reset edge detection
+            return true; // Button was just pressed
+        }
+        uint32_t now = get_time_ms();
+        if (last_press == 0)
+            last_press = now; // should not happen, but just in case        
+        if (detection_mode == 2)
+        {
+            if ((now - last_press) >= 5000) // 5 seconds hold
+            {
+                last_press = now; // prevent multiple triggers
+                return true; // Long press detected
+            }
+        }
+    }
+    if (detection_mode == 1) 
+        return raw_state;
+    else 
+        return false; // Button not pressed or still pressed, but not long enough to provoke long press
+}
+
+
+/**  
+ * @brief Detect if the left button is pressed.
+ * @param raw set to True to get the raw button state, False to get auto repeating (3 per sec), and debounced leading edge only
+ * @return True if button was pressed, False otherwise
+ **/
+bool btn_left(bool raw) 
+{ 
+    static bool previous_state = false;
+    static uint32_t last_press = 0;
+
+    bool raw_state = (nrf_gpio_pin_read(PIN_BTN_LEFT) == 0); // active low
+    if (raw)
+    {
+        previous_state = raw_state; // keep previous state for next call, that may need debounce
+        return raw_state;
+    }
+    if (raw_state != previous_state)
+    {        
+        nrf_delay_ms(10); // Debounce delay
+        raw_state = (nrf_gpio_pin_read(PIN_BTN_LEFT) == 0); // re-read after debounce delay
+        if (raw_state != previous_state)
+        {
+            previous_state = raw_state;
+            if (raw_state)
+            {
+                last_press = get_time_ms();
+                return true; // Button was just pressed
+            }
+        }
+    }
+    else if (raw_state) // still pressed
+    {
+        if (last_press == 0)
+            last_press = get_time_ms(); // should not happen, but just in case        
+        uint32_t now = get_time_ms();
+        if ((now - last_press) >= 333) // 333ms delay for auto repeat
+        {
+            last_press = now;
+            return true; // Auto repeat press
+        }
+    }
+    return false; // Button not pressed or still pressed (but not long enough to provoke auto repeat)
+}
+
+/**  
+ * @brief Detect if the right button is pressed.
+ * @param raw set to True to get the raw button state, False to get auto repeating (3 per sec), and debounced leading edge only
+ * @return True if button was pressed, False otherwise
+ **/
+bool btn_right(bool raw) 
+{ 
+    static bool previous_state = false;
+    static uint32_t last_press = 0;
+
+    bool raw_state = (nrf_gpio_pin_read(PIN_BTN_RIGHT) == 0); // active low
+    if (raw)
+    {
+        previous_state = raw_state; // keep previous state for next call, that may need debounce
+        return raw_state;
+    }
+    if (raw_state != previous_state)
+    {        
+        nrf_delay_ms(10); // Debounce delay
+        raw_state = (nrf_gpio_pin_read(PIN_BTN_RIGHT) == 0); // re-read after debounce delay
+        if (raw_state != previous_state)
+        {
+            previous_state = raw_state;
+            if (raw_state)
+            {
+                last_press = get_time_ms();
+                return true; // Button was just pressed
+            }
+        }
+    }
+    else if (raw_state) // still pressed
+    {
+        if (last_press == 0)
+            last_press = get_time_ms(); // should not happen, but just in case
+        uint32_t now = get_time_ms();
+        if ((now - last_press) >= 333) // 333ms delay for auto repeat
+        {
+            last_press = now;
+            return true; // Auto repeat press
+        }
+    }
+    return false; // Button not pressed or still pressed (but not long enough to provoke auto repeat)
+}
 
 void buttons_init(void)
 {
@@ -297,12 +1027,25 @@ void buttons_init(void)
     nrf_gpio_cfg_input(PIN_BTN_MID, NRF_GPIO_PIN_PULLUP);
     nrf_gpio_cfg_input(PIN_BTN_RIGHT, NRF_GPIO_PIN_PULLUP);
     nrf_gpio_cfg_input(PIN_CHRG_STAT, NRF_GPIO_PIN_PULLUP);
+    // and init their local variables
+    btn_mid(-1); // initialize previous state
+    btn_left(true); // initialize previous state
+    btn_right(true); // initialize previous state
 }
 
-bool btn_left() { return (nrf_gpio_pin_read(PIN_BTN_LEFT) == 0); }
-bool btn_mid() { return (nrf_gpio_pin_read(PIN_BTN_MID) == 0); }
-bool btn_right() { return (nrf_gpio_pin_read(PIN_BTN_RIGHT) == 0); }
+#pragma endregion Buttons
 
+#pragma region Power Management and Timer
+// --------------------------------------------------------------------------
+// Power Management and Timer
+// --------------------------------------------------------------------------
+
+
+/**
+ * @brief Enter deep sleep mode.
+ * This function will turn off the LCD, disable the radio, and configure the mid button to wake up the device.
+ * This function does not return.
+ **/
 void enter_deep_sleep(void)
 {
     memset(m_frame_buffer, 0, 1024);
@@ -335,6 +1078,13 @@ uint32_t get_time_ms(void)
     NRF_TIMER0->TASKS_CAPTURE[0] = 1;
     return (NRF_TIMER0->CC[0]) / 1000;
 }
+
+#pragma endregion Power Management and Timer
+
+#pragma region SAADC (Battery Measurement)
+// --------------------------------------------------------------------------
+// SAADC (Battery Measurement)
+// --------------------------------------------------------------------------
 
 void saadc_init_simple(void)
 {
@@ -402,7 +1152,17 @@ void bat_measure_update(void)
     current_bat_status.level = level;
     current_bat_status.is_charging = (nrf_gpio_pin_read(PIN_CHRG_STAT) == 0);
 }
+#pragma endregion SAADC (Battery Measurement)
 
+#pragma region Radio Scanner
+// --------------------------------------------------------------------------
+// Radio Scanner
+// --------------------------------------------------------------------------
+
+
+/**
+ * @brief Initialize the radio for scanning
+ **/
 void radio_init_scanner(void)
 {
     NRF_RADIO->TASKS_DISABLE = 1;
@@ -412,6 +1172,11 @@ void radio_init_scanner(void)
     NRF_RADIO->MODE = (RADIO_MODE_MODE_Ble_1Mbit << RADIO_MODE_MODE_Pos);
 }
 
+
+/**
+ * @brief scans the radio.
+ * This function fills the `m_rssi_current[]` array with RSSI values for each frequency in the scan range.
+ **/
 void scan_band(void)
 {
     if ((NRF_CLOCK->HFCLKSTAT & (CLOCK_HFCLKSTAT_SRC_Msk | CLOCK_HFCLKSTAT_STATE_Msk)) !=
@@ -443,44 +1208,151 @@ void scan_band(void)
     }
 }
 
-// --------------------------------------------------------------------------
-// APPLICATION LOGIC
-// --------------------------------------------------------------------------
+// Frequency mapping table to IEEE 802.15.4 channel, WiFi channel, and BLE channel
+// this is not memory optimal, but CPU optimal, as the index is the frequency.
+// index = frequency - SCAN_BASE_FREQ
+// -1 means: not a center frequency for that standard
+// columns: 802.15.4, 802.11b/g/n WiFi, BLE
+// These columns must be aligned with the scanner_mode_names, offset by 1.
+const int8_t freq_to_channel_map[BANDWIDTH][3] = {
+    { -1, -1, -1}, // 2400
+    { -1, -1, -1}, // 2401
+    { -1, -1, 37}, // 2402
+    { -1, -1, -1}, // 2403
+    { -1, -1,  0}, // 2404
+    { 11, -1, -1}, // 2405
+    { -1, -1,  1}, // 2406
+    { -1, -1, -1}, // 2407
+    { -1, -1,  2}, // 2408
+    { -1, -1, -1}, // 2409
+    { 12, -1,  3}, // 2410
+    { -1, -1, -1}, // 2411
+    { -1,  1,  4}, // 2412
+    { -1, -1, -1}, // 2413
+    { -1, -1,  5}, // 2414
+    { 13, -1, -1}, // 2415
+    { -1, -1,  6}, // 2416
+    { -1,  2, -1}, // 2417
+    { -1, -1,  7}, // 2418
+    { -1, -1, -1}, // 2419
+    { 14, -1,  8}, // 2420
+    { -1, -1, -1}, // 2421
+    { -1,  3,  9}, // 2422
+    { -1, -1, -1}, // 2423
+    { -1, -1, 10}, // 2424
+    { 15, -1, -1}, // 2425
+    { -1, -1, 38}, // 2426
+    { -1,  4, -1}, // 2427
+    { -1, -1, 11}, // 2428
+    { -1, -1, -1}, // 2429
+    { 16, -1, 12}, // 2430
+    { -1, -1, -1}, // 2431
+    { -1,  5, 13}, // 2432
+    { -1, -1, -1}, // 2433
+    { -1, -1, 14}, // 2434
+    { 17, -1, -1}, // 2435
+    { -1, -1, 15}, // 2436
+    { -1,  6, -1}, // 2437
+    { -1, -1, 16}, // 2438
+    { -1, -1, -1}, // 2439
+    { 18, -1, 17}, // 2440
+    { -1, -1, -1}, // 2441
+    { -1,  7, 18}, // 2442
+    { -1, -1, -1}, // 2443
+    { -1, -1, 19}, // 2444
+    { 19, -1, -1}, // 2445
+    { -1, -1, 20}, // 2446
+    { -1,  8, -1}, // 2447
+    { -1, -1, 21}, // 2448
+    { -1, -1, -1}, // 2449
+    { 20, -1, 22}, // 2450
+    { -1, -1, -1}, // 2451
+    { -1,  9, 23}, // 2452
+    { -1, -1, -1}, // 2453
+    { -1, -1, 24}, // 2454
+    { 21, -1, -1}, // 2455
+    { -1, -1, 25}, // 2456
+    { -1, 10, -1}, // 2457
+    { -1, -1, 26}, // 2458
+    { -1, -1, -1}, // 2459
+    { 22, -1, 27}, // 2460
+    { -1, -1, -1}, // 2461
+    { -1, 11, 28}, // 2462
+    { -1, -1, -1}, // 2463
+    { -1, -1, 29}, // 2464
+    { 23, -1, -1}, // 2465
+    { -1, -1, 30}, // 2466
+    { -1, 12, -1}, // 2467
+    { -1, -1, 31}, // 2468
+    { -1, -1, -1}, // 2469
+    { 24, -1, 32}, // 2470
+    { -1, -1, -1}, // 2471
+    { -1, 13, 33}, // 2472
+    { -1, -1, -1}, // 2473
+    { -1, -1, 34}, // 2474
+    { 25, -1, -1}, // 2475
+    { -1, -1, 35}, // 2476
+    { -1, -1, -1}, // 2477
+    { -1, -1, 36}, // 2478
+    { -1, -1, -1}, // 2479
+    { 26, -1, 39}, // 2480
+    { -1, -1, -1}, // 2481
+    { -1, -1, -1}, // 2482
+    { -1, -1, -1}, // 2483
+    { -1, 14, -1}, // 2484
+    { -1, -1, -1}, // 2485
+    { -1, -1, -1}, // 2486
+    { -1, -1, -1}  // 2487
+};
 
-void process_waterfall(void)
+/**
+ * @brief Convert frequency to channel number for given mode
+ * 
+ * @param freq Frequency in MHz, already offset by SCAN_BASE_FREQ
+ * @param mode SCAN_MODE_802_15_4, SCAN_MODE_802_11, SCAN_MODE_BLE
+ * @return int Channel number, or -1 if not a valid channel for that mode
+ **/
+int freq_to_channel(int freq, int mode)
 {
-    for (int x = 0; x < DISP_W; x++)
-    {
-        int freq_idx = (x * BANDWIDTH) / DISP_W;
-        uint8_t val = m_rssi_current[freq_idx];
-        bool pixel_on = (val < 88);
-        uint32_t col = (m_waterfall_data[x][3] << 24) | (m_waterfall_data[x][2] << 16) | (m_waterfall_data[x][1] << 8) | m_waterfall_data[x][0];
-        col <<= 1;
-        if (pixel_on)
-            col |= 1;
-        m_waterfall_data[x][0] = (col & 0xFF);
-        m_waterfall_data[x][1] = (col >> 8) & 0xFF;
-        m_waterfall_data[x][2] = (col >> 16) & 0xFF;
-        m_waterfall_data[x][3] = (col >> 24) & 0xFF;
-    }
+    // translate SCAN_MODE_802_15_4, SCAN_MODE_802_11, SCAN_MODE_BLE to 0..2
+    mode -= 1;
+    if (mode < 0 || mode > 2)
+        return -1;
+    if (freq < SCAN_START_FREQ || freq > SCAN_END_FREQ)
+        return -1;
+    return freq_to_channel_map[freq - SCAN_START_FREQ][mode];
 }
 
+#pragma endregion Radio Scanner
+
+#pragma region UI Functions - rendering
+// --------------------------------------------------------------------------
+// UI Functions - rendering
+// --------------------------------------------------------------------------
+
+/**
+ * @brief Show the boot "splash screen"
+ **/
 void show_boot_screen(void)
 {
     memset(m_frame_buffer, 0, 1024);
 
-    draw_box(2, 2, 124, 60, false, true);
-    draw_box(4, 4, 120, 56, false, true);
+    draw_boundingbox(2);
+    draw_boundingbox(4);
 
-    draw_text_buf(46, 15, "2.4GHz");
-    draw_text_buf(40, 25, "SPECTRUM");
-    draw_text_buf(40, 35, "ANALYZER");
-    draw_text_buf(44, 45, "ATC1441");
+    draw_text_buf_centered(15, "2.4GHz");
+    draw_text_buf_centered(25, "SPECTRUM");
+    draw_text_buf_centered(35, "ANALYZER");
+    draw_text_buf_centered(45, "ATC1441");
 
     lcd_flush();
     nrf_delay_ms(1500);
 }
 
+
+/**
+ * @brief Startup screen sequence
+ **/
 void check_power_on_sequence(void)
 {
 	// Sometimes not working so only activate in development or so
@@ -496,7 +1368,7 @@ void check_power_on_sequence(void)
     // If from Deep Sleep: Check if button is held
     for (int i = 0; i < 20; i++)
     {
-        if (!btn_mid())
+        if (!btn_mid(1)) // this is the only use of raw button read: need to see if it is still pressed.
         {
             memset(m_frame_buffer, 0, 1024);
             lcd_flush();
@@ -504,24 +1376,207 @@ void check_power_on_sequence(void)
         }
 
         memset(m_frame_buffer, 0, 1024);
-        draw_text_buf(25, 25, "HOLD TO START");
+        draw_text_buf_centered(25, "HOLD TO START");
 
-        draw_box(14, 38, 100, 8, false, true);
-        int fill = (i * 96) / 19;
-        draw_box(16, 40, fill, 4, true, true);
+        draw_filled_bar(-1, 38, 100, 8, i, 19, true);
 
         lcd_flush();
         nrf_delay_ms(50);
     }
 }
 
+/**
+ * @brief Render the battery icon at the specified position.
+ * 
+ * @param x The x-coordinate for the battery icon. Use -1 for right aligned.
+ * @param y The y-coordinate for the battery icon.
+ */
+void render_battery_icon(int x, int y)
+{
+    int h = 7;
+    // the battery
+    int wm = (2 * 8) + 2; // 2 pixels per level + 2 pixels border
+    if (x < 0)
+        x = DISP_W - (wm + 4); // right aligned
+    draw_filled_bar(x, y, wm, h, current_bat_status.level, 8, false);
+    // tip of the battery
+    draw_box(x + wm, y+2, 2, h-4, false, true);
+}
+
+
+/**
+ * @brief Measure the battery and render the battery status, top right on the screen. 
+ */
+void render_battery(void)
+{
+    char buf[10];
+    // Battery Update (rarely)
+    static int batt_ctr = 0;
+    if (batt_ctr == 0)
+    {
+        bat_measure_update();
+    }
+    if (batt_ctr++ > 60)
+    {
+        batt_ctr = 0;
+    }
+
+    if (current_bat_status.is_charging)
+    {
+        draw_text_buf_right(0, "CHRG");
+    }
+    else
+    {
+        // text
+        // int pct = (current_bat_status.level * 100) / 8;
+        // sprintf(buf, "%d%%", pct);
+        // draw_text_buf_right(0, buf);
+
+        // icon
+        render_battery_icon(-1, 0);
+    }
+}
+
+
+/**
+ * @brief calculates the frequence (offset to SCAN_BASE_FREQ) for a column on screen
+ * 
+ * @param column 
+ * @return int he offset to SCAN_BASE_FREQ for a column on screen
+ **/
+int column_to_freq(int column)
+{
+    if (column < 0)
+        column = 0;
+    if (column >= DISP_W)
+        column = DISP_W - 1;
+    int freq_idx = (column * BANDWIDTH) / DISP_W;
+    return SCAN_START_FREQ + freq_idx;
+}
+
+
+/**
+ * @brief Process the waterfall data in the scanner view, by shifting down and adding new line.
+ * 
+ * To be called only by `render_scanner()`
+ **/
+void process_scanner_waterfall(void)
+{
+#define WATERFALL_MINIMUM_VALUE 88
+
+    for (int x = 0; x < DISP_W; x++)
+    {
+        int freq_idx = column_to_freq(x);
+        uint8_t val = m_rssi_current[freq_idx];
+        bool pixel_on = (val < WATERFALL_MINIMUM_VALUE); // this is a threshold for turning the pixel on
+        uint32_t col = (m_waterfall_data[x][3] << 24) | (m_waterfall_data[x][2] << 16) | (m_waterfall_data[x][1] << 8) | m_waterfall_data[x][0];
+        col <<= 1;
+        if (pixel_on)
+            col |= 1;
+        m_waterfall_data[x][0] = (col & 0xFF);
+        m_waterfall_data[x][1] = (col >> 8) & 0xFF;
+        m_waterfall_data[x][2] = (col >> 16) & 0xFF;
+        m_waterfall_data[x][3] = (col >> 24) & 0xFF;
+    }
+}
+
+/**
+ * @brief Render only the waterfall part of the scanner screen
+ * 
+ * To be called only by `render_scanner()`
+ **/
+void render_scanner_waterfall(void)
+{
+    // Draw Waterfall (Bottom half)
+    int start_page = SPECTRUM_H / 8;
+    for (int x = 0; x < DISP_W; x++)
+    {
+        for (int p = 0; p < 4; p++)
+        {
+            if (start_page + p < 8)
+                m_frame_buffer[x + (start_page + p) * DISP_W] = m_waterfall_data[x][p];
+        }
+    }
+}
+
+/**
+ * @brief Render the channel markers
+ * 
+ * To be called only by `render_scanner()`
+ * @param mode SCAN_MODE_802_15_4, SCAN_MODE_802_11, SCAN_MODE_BLE
+ **/
+void render_scanner_channels(int mode) 
+{
+// channel numbers are 16 pixes high 
+#define CHANNEL_TOP_TEXT (DISP_H - 16)
+    // Draw Waterfall with channel markers (Bottom half)
+    int start_page = SPECTRUM_H / 8;
+    int last_channel = -1;
+    for (int x = 0; x < DISP_W; x++)
+    {
+        int freq_idx = column_to_freq(x);
+        int channel = freq_to_channel(freq_idx, mode);
+        if (channel != -1)
+        {
+            if (channel == last_channel)
+                continue; // already drawn
+            last_channel = channel;
+            bool draw_channel_nr = true;
+            enum line_type_enum { LINE_NORMAL = 0, LINE_SHORT, LINE_DOTTED };
+            enum line_type_enum line_type = LINE_NORMAL; // normal line. 
+            if (mode == 3)
+            {
+                // for BLE
+                if (channel == 37 || channel == 38 || channel == 39)
+                {
+                    // special case for advertising channels
+                    line_type = LINE_DOTTED;
+                    draw_channel_nr = false; // would be nice, but messes up
+                } 
+                else
+                {
+                    // too many channels, only draw every 5th channel number
+                    if (channel % 5 != 0)
+                    {
+                        draw_channel_nr = false;
+                        line_type = LINE_SHORT;
+                    }
+                }
+            }
+            // draw line
+            switch (line_type)
+            {
+                case LINE_NORMAL:
+                    draw_vline(x, SPECTRUM_H + 2, CHANNEL_TOP_TEXT - 2);
+                    break;
+                case LINE_SHORT:
+                    draw_vline(x, SPECTRUM_H + 2, CHANNEL_TOP_TEXT - 4);
+                    break;
+                case LINE_DOTTED:
+                    for (int y = SPECTRUM_H + 2; y <= CHANNEL_TOP_TEXT - 2; y += 2)
+                    {
+                        draw_pixel(x, y, true);
+                    }
+                    break;
+            }
+
+            // draw channel number vertically
+            if (draw_channel_nr)
+                draw_nr_vertical(x, CHANNEL_TOP_TEXT, channel);
+        }
+    }
+}
+
+/**
+ * @brief Render the main scanner screen
+ **/
 void render_scanner(void)
 {
     memset(m_frame_buffer, 0, 1024);
 
     for (int x = 0; x < DISP_W; x++)
     {
-        int freq_idx = (x * BANDWIDTH) / DISP_W;
+        int freq_idx = column_to_freq(x);
         if (freq_idx >= BANDWIDTH)
             freq_idx = BANDWIDTH - 1;
         uint8_t val = m_rssi_current[freq_idx];
@@ -533,7 +1588,7 @@ void render_scanner(void)
         if (height < 0)
             height = 0;
 
-        // Peak Hold Logic
+        // Peak Hold Logic with gradual falloff
         if (height >= m_rssi_peak[freq_idx])
             m_rssi_peak[freq_idx] = height;
         else if (m_rssi_peak[freq_idx] > 0)
@@ -543,7 +1598,7 @@ void render_scanner(void)
         if (bar_h > 0)
             draw_vline(x, SPECTRUM_H - bar_h, SPECTRUM_H - 1);
 
-        // Floating Dot
+        // Floating Dot, even slower falloff
         float fh = (float)height;
         if (fh >= m_rssi_floating[freq_idx])
             m_rssi_floating[freq_idx] = fh;
@@ -554,61 +1609,67 @@ void render_scanner(void)
                 m_rssi_floating[freq_idx] = 0;
         }
 
-        int dot_y = SPECTRUM_H - (int)m_rssi_floating[freq_idx] - 2;
-        if (dot_y >= 0 && dot_y < SPECTRUM_H)
+        int dot_y;
+        if ((int)m_rssi_floating[freq_idx] <= 0)
+            dot_y = SPECTRUM_H - 1 ; // base line
+        else 
+            dot_y = SPECTRUM_H - (int)m_rssi_floating[freq_idx] - 2; // 2 offset
+        if (dot_y >= 0)
             draw_pixel(x, dot_y, true);
     }
 
-    process_waterfall();
+    process_scanner_waterfall();
 
-    // Draw Waterfall (Bottom half)
-    int start_page = WATERFALL_START / 8;
-    for (int x = 0; x < DISP_W; x++)
+    switch (scanner_selection)
     {
-        for (int p = 0; p < 4; p++)
-        {
-            if (start_page + p < 8)
-                m_frame_buffer[x + (start_page + p) * DISP_W] = m_waterfall_data[x][p];
-        }
+        case SCAN_MODE_FREQUENCY:
+            render_scanner_waterfall();
+            break;
+        case SCAN_MODE_802_15_4:
+        case SCAN_MODE_802_11:
+        case SCAN_MODE_BLE:
+            render_scanner_channels(scanner_selection);
+            break;
+        default:
+            draw_text_buf_centered(0, "UNKNOWN MODE");
+            break;
     }
 
     // Info Text
-    char buf[20];
+    char buf[40];
+#ifdef SHOW_FPS_INDICATOR
+    // show the FPS for debugging
     sprintf(buf, "%luhz", m_fps);
-    draw_text_buf(0, 0, buf);
-    sprintf(buf, "%d", 2400 + SCAN_START_FREQ);
-    draw_text_buf(0, 56, buf);
-    sprintf(buf, "%d", 2400 + SCAN_END_FREQ);
-    draw_text_buf(100, 56, buf);
-
-    // Battery Update (rarely)
-    static int batt_ctr = 0;
-    if (batt_ctr++ > 60)
+    draw_text_buf_left( 0, buf);
+#else
+    // scanner modes
+    sprintf(buf, "%s", scanner_mode_names[scanner_selection]);
+    draw_text_buf_left( 0, buf);
+#endif
+    // Frequency Labels
+    if (scanner_selection == 0)
     {
-        bat_measure_update();
-        batt_ctr = 0;
+        sprintf(buf, "%d", SCAN_BASE_FREQ + column_to_freq(0));
+        draw_text_buf_left( 56, buf);
+        sprintf(buf, "%d", SCAN_BASE_FREQ + column_to_freq(DISP_W - 1));
+        draw_text_buf_right(56, buf);
     }
 
-    if (current_bat_status.is_charging)
-    {
-        draw_text_buf(100, 0, "CHRG");
-    }
-    else
-    {
-        int pct = (current_bat_status.level * 100) / 8;
-        sprintf(buf, "%d%%", pct);
-        draw_text_buf(100, 0, buf);
-    }
+    // Battery Status
+    render_battery();
 
     lcd_flush();
 }
 
+/**
+ * @brief Render the info screen
+ **/
 void render_info(void)
 {
     memset(m_frame_buffer, 0, 1024);
 
     // Border
-    draw_box(0, 0, 128, 64, false, true);
+    draw_boundingbox(0);
 
     draw_text_buf(4, 4, "Made by ATC1441");
 
@@ -622,63 +1683,387 @@ void render_info(void)
     lcd_flush();
 }
 
+// The left alignment column for settings items
+#define SETTINGS_LEFT_X 25
+
+/**
+ * @brief Render a single settings item line.
+ * 
+ * @param line Line number to render. -1 for header, 0 for "back" (no value to show)
+ * @param active if that settings item is the active one
+ * @param value the value to show for that settings item
+ * @param max_value the maximum value for that settings item
+ **/
+void render_settings_item(int line, bool active, uint8_t value, int max_value)
+{
+    if (line < 0) 
+    {
+        // this is the header
+        draw_text_buf_centered(3, "SETTINGS");
+        return;
+    }
+
+    if (line > NR_SETTINGS_ITEMS - 1)
+        return; // out of range
+    
+    int x = SETTINGS_LEFT_X;
+    int y = 12;
+    bool has_value = true;
+    if (line == 0)
+    {
+        // this is the "back" item
+        has_value = false;
+        active = false; // cannot be active        
+    } 
+    else
+    {
+        y = 2 + (line * 20);
+    }
+
+    int slider_y = y + 10;
+    if (line == settings_selection)
+    {
+        if (active)
+            draw_char_buf(x - 4, slider_y, 0x7F); // '►' character
+        else
+            draw_char_buf(x - 10, y, 0x7F); // '►' character
+    }
+    const char *text = settings_item_names[line];
+    if (has_value == false)
+    {
+        draw_text_buf(x, y, text);
+        return;
+    }
+    char buf[40];
+    sprintf(buf, "%s: %d", text, value);
+    draw_text_buf(x, y, buf);
+    draw_filled_bar(x + 6, slider_y, MAX_CONTRAST + 2, 8, value, max_value, false);  // MAX_CONTRAST width so all have the same width
+}
+
+/**
+ * @brief Render the settings screen.
+ * 
+ * @param setting_selected The currently selected setting item
+ **/
+void render_settings(bool setting_selected)
+{
+    memset(m_frame_buffer, 0, 1024);
+
+    draw_boundingbox(0);
+
+    render_settings_item(-1, false, 0, 0); // header
+
+    for (int line = 0; line < NR_SETTINGS_ITEMS; line++)
+    {
+        switch (line)   
+        {
+            case SETTINGS_BACK:
+                render_settings_item(line, false, 0, 0);
+                break;
+            case SETTINGS_CONTRAST:
+                render_settings_item(line, setting_selected, m_contrast_level, MAX_CONTRAST);
+                break;
+#ifndef OLED_TYPE_SH1106       
+            case SETTINGS_BACKLIGHT:
+                render_settings_item(line, setting_selected, m_backlight_level, MAX_BACKLIGHT);
+                break;
+#endif                
+            default:
+                break;
+        }
+    }    
+
+    lcd_flush();
+}
+
+// The left alignment column for menu items
+#define MENU_LEFT_X 25
+
+
+/**
+ * @brief Render a single menu item line.
+ * 
+ * @param line Line number to render. -1 for header.
+ **/
+void render_menu_item(int line)
+{
+    if (line < 0) 
+    {
+        // this is the header
+        draw_text_buf_centered(3, "MENU");
+        return;
+    }
+
+    if (line > NR_MENU_ITEMS - 1)
+        return; // out of range
+    
+    int x = MENU_LEFT_X;
+    int y = (line * 8) + 21;
+    if (line == menu_selection)
+    {
+        draw_char_buf(x - 10, y, 0x7F); // '►' character
+    }
+    const char *text = menu_item_names[line];
+    draw_text_buf(x, y, text);
+}
+
+
+/**
+ * @brief Render the menu screen.
+ * It does not act on buttons, just renders the current state.
+ **/
 void render_menu(void)
 {
     bat_measure_update();
     memset(m_frame_buffer, 0, 1024);
 
-    draw_box(10, 2, 108, 60, false, true);
+    draw_boundingbox(0);
 
-    draw_text_buf(52, 4, "MENU");
+    render_menu_item(-1); // header
 
+    // Battery Status
     char buf[30];
     int v_int = (int)current_bat_status.voltage;
     int v_dec = (int)((current_bat_status.voltage - v_int) * 100);
-    sprintf(buf, "%d.%02dV", v_int, v_dec);
+    int y = 11;
+    sprintf(buf, "Batt: %d.%02dV", v_int, v_dec);
+    draw_text_buf(MENU_LEFT_X, y, buf);
 
-    draw_text_buf(30, 13, buf);
+    int x = MENU_LEFT_X + ((strlen(buf) + 1) * 6); // N chars width + 2 chars space
+    render_battery_icon(x, y);
 
-    draw_box(30, 22, 64, 4, false, true);
-    if (current_bat_status.level > 0)
+    // Menu Items
+    for (int line = 0; line < NR_MENU_ITEMS; line++)
     {
-        int w = (current_bat_status.level * 62) / 8;
-        draw_box(31, 23, w, 2, true, true);
+        render_menu_item(line);
     }
-
-    // Item 0: Back
-    if (menu_selection == 0)
-        draw_text_buf(25, 29, "> Back");
-    else
-        draw_text_buf(25, 29, "  Back");
-
-    // Item 1: Info
-    if (menu_selection == 1)
-        draw_text_buf(25, 37, "> Info");
-    else
-        draw_text_buf(25, 37, "  Info");
-
-    // Item 2: Sleep
-    if (menu_selection == 2)
-        draw_text_buf(25, 45, "> Sleep");
-    else
-        draw_text_buf(25, 45, "  Sleep");
-
-    // Item 3: DFU
-    if (menu_selection == 3)
-        draw_text_buf(25, 53, "> DFU");
-    else
-        draw_text_buf(25, 53, "  DFU");
 
     lcd_flush();
 }
 
+
+/**
+ * @brief Tell the user that the device goes to sleep, and then go to sleep.
+ * This function does not return
+ **/
+void render_goto_sleep(void)
+{
+    memset(m_frame_buffer, 0, 1024);
+    draw_text_buf_centered(30, "GOODBYE");
+    lcd_flush();
+    nrf_delay_ms(1000);
+    enter_deep_sleep(); // This function does not return
+}
+
+
+/**
+ * @brief Tell the user the device goes to DFU mode, and then reset to the DFU bootloader.
+ * This function does not return.
+ **/
+void render_goto_dfu(void)
+{
+    memset(m_frame_buffer, 0, 1024);
+    draw_text_buf_centered(30, "ENTERING DFU...");
+    lcd_flush();
+    nrf_delay_ms(1000);
+
+    // Signal to bootloader to enter DFU mode
+    NRF_POWER->GPREGRET = BOOTLOADER_DFU_START;
+    NVIC_SystemReset(); // This function does not return
+}
+
+#pragma endregion UI Functions - rendering
+
+#pragma region UI Functions - interacting
 // --------------------------------------------------------------------------
-// MAIN
+// UI Functions - interacting
+// --------------------------------------------------------------------------
+
+
+/**
+ * @brief handles the scanner interactions
+ */
+void handle_scanner(void)
+{
+    scan_band();
+    render_scanner();
+
+    // Interaction
+    if (btn_mid(0))
+    {
+        current_state = STATE_MENU;
+        menu_selection = MENU_BACK; // Reset selection on entry
+    }
+    if (btn_left(false)) scanner_selection--;
+    if (btn_right(false)) scanner_selection++;
+    // wrap around scanner mode selections
+    if (scanner_selection < 0)
+        scanner_selection = NR_SCANNER_MODES - 1;
+    if (scanner_selection > NR_SCANNER_MODES - 1)
+        scanner_selection = 0;
+
+#ifdef SHOW_FPS_INDICATOR
+    // FPS Counter
+    m_frame_count++;
+    uint32_t now = get_time_ms();
+    if (now - m_last_time >= 1000)
+    {
+        m_fps = m_frame_count;
+        m_frame_count = 0;
+        m_last_time = now;
+    }
+#endif         
+}
+
+/**
+ * @brief Handle the menu interactions
+ **/
+void handle_menu(void)
+{
+    render_menu();
+
+    if (btn_left(false)) menu_selection--;
+    if (btn_right(false)) menu_selection++;
+    // wrap around menu selection
+    if (menu_selection < 0)
+        menu_selection = NR_MENU_ITEMS - 1;
+    if (menu_selection > NR_MENU_ITEMS - 1)
+        menu_selection = 0;
+
+    if (btn_mid(0))
+    {
+        switch (menu_selection)
+        {
+            case MENU_BACK:
+                current_state = STATE_SCANNER;
+                break;
+            case MENU_ABOUT:
+                current_state = STATE_INFO;
+                break;
+            case MENU_SLEEP:
+                render_goto_sleep(); // this halts the program (in a deep sleep mode)
+                break;
+            case MENU_FIRMWARE_UPDATE:
+                render_goto_dfu(); // this exits to a bootloader
+                break;
+            case MENU_SETTINGS:
+                current_state = STATE_SETTINGS;
+                break;
+            default:
+                // do nothing
+                break;
+        }
+    }
+    nrf_delay_ms(150);
+}
+
+
+/**
+ * @brief Handle the "About" screen interactions
+ */
+void handle_info(void)
+{
+    render_info();
+    // Press any key to go back
+    if (btn_mid(0) || btn_left(false) || btn_right(false))
+    {
+        current_state = STATE_MENU;
+        nrf_delay_ms(150);
+    }
+}
+
+static bool setting_selected = false;
+
+/**
+ * @brief Handles the Settings interactions
+ */
+void handle_settings(void)
+{
+    render_settings(setting_selected);
+
+    if (setting_selected == false)
+    {
+        // navigate settings items
+        if (btn_mid(0))
+        {
+            if (settings_selection == SETTINGS_BACK)
+            {
+                current_state = STATE_MENU;
+                settings_save(); // will check if changes are needed to be persisted
+                nrf_delay_ms(150);
+                return;
+            } 
+            else
+            {
+                setting_selected = true;
+            }
+        }
+        if (btn_left(false)) settings_selection--;
+        if (btn_right(false)) settings_selection++;
+        // wrap around menu selection
+        if (settings_selection < 0)
+            settings_selection = NR_SETTINGS_ITEMS - 1;
+        if (settings_selection > NR_SETTINGS_ITEMS - 1)
+            settings_selection = 0;
+    }
+    else
+    {
+        // in value change mode
+        if (btn_mid(0))
+        {
+            setting_selected = false; // exit value change mode
+            nrf_delay_ms(150);
+        } 
+        else
+        {
+            if (settings_selection == SETTINGS_CONTRAST)
+            {
+                if (btn_left(false))
+                {
+                    if (m_contrast_level > MIN_CONTRAST)
+                        m_contrast_level--;
+                    lcd_set_contrast(m_contrast_level);
+                }
+                if (btn_right(false))
+                {
+                    if (m_contrast_level < MAX_CONTRAST)
+                        m_contrast_level++;
+                    lcd_set_contrast(m_contrast_level);
+                }       
+            }
+#ifndef OLED_TYPE_SH1106     
+            else if (settings_selection == SETTINGS_BACKLIGHT)
+            {
+                if (btn_left(false))
+                {
+                    if (m_backlight_level > MIN_BACKLIGHT)
+                        m_backlight_level--;
+                    lcd_set_backlight(m_backlight_level);
+                }
+                if (btn_right(false))
+                {
+                    if (m_backlight_level < MAX_BACKLIGHT)
+                        m_backlight_level++;
+                    lcd_set_backlight(m_backlight_level);
+                }       
+            }
+#endif
+        }
+    }
+
+}
+
+#pragma endregion UI Functions - interacting
+
+#pragma region Main Application
+// --------------------------------------------------------------------------
+// Main Application
 // --------------------------------------------------------------------------
 
 int main(void)
 {
     // Init Hardware
+    settings_init();
     timer_init();
     buttons_init();
     lcd_init();
@@ -700,94 +2085,38 @@ int main(void)
     memset(m_rssi_peak, 0, sizeof(m_rssi_peak));
     memset(m_rssi_floating, 0, sizeof(m_rssi_floating));
     memset(m_waterfall_data, 0, sizeof(m_waterfall_data));
+#ifdef SHOW_FPS_INDICATOR
     m_last_time = get_time_ms();
+#endif
+
+    buttons_init(); // again, to kill any long press state from boot
 
     while (1)
     {
-        if (current_state == STATE_SCANNER)
+        if (btn_mid(2))
         {
-            scan_band();
-            render_scanner();
-
-            // Interaction
-            if (btn_mid())
-            {
-                current_state = STATE_MENU;
-                menu_selection = 0; // Reset selection on entry
-                nrf_delay_ms(200);
-            }
-
-            // FPS Counter
-            m_frame_count++;
-            uint32_t now = get_time_ms();
-            if (now - m_last_time >= 1000)
-            {
-                m_fps = m_frame_count;
-                m_frame_count = 0;
-                m_last_time = now;
-            }
+            // Long press to enter deep sleep from any state
+            render_goto_sleep();
         }
-        else if (current_state == STATE_MENU)
+        switch (current_state)
         {
-            render_menu();
-
-            if (btn_left())
-            {
-                menu_selection--;
-                if (menu_selection < 0)
-                    menu_selection = 3; // Wrap around (4 items)
-                nrf_delay_ms(150);
-            }
-            if (btn_right())
-            {
-                menu_selection++;
-                if (menu_selection > 3)
-                    menu_selection = 0; // Wrap around (4 items)
-                nrf_delay_ms(150);
-            }
-            if (btn_mid())
-            {
-                if (menu_selection == 0)
-                {
-                    current_state = STATE_SCANNER;
-                }
-                else if (menu_selection == 1)
-                {
-                    current_state = STATE_INFO;
-                }
-                else if (menu_selection == 2)
-                {
-                    memset(m_frame_buffer, 0, 1024);
-                    draw_text_buf(40, 30, "GOODBYE");
-                    lcd_flush();
-                    nrf_delay_ms(800);
-                    enter_deep_sleep();
-                }
-                else if (menu_selection == 3)
-                {
-                    // DFU ENTRY
-                    memset(m_frame_buffer, 0, 1024);
-                    draw_text_buf(35, 30, "BOOTLOADER");
-                    lcd_flush();
-                    nrf_delay_ms(500);
-
-                    // Signal to bootloader to enter DFU mode
-                    NRF_POWER->GPREGRET = BOOTLOADER_DFU_START;
-                    NVIC_SystemReset();
-                }
-                nrf_delay_ms(500);
-            }
-            nrf_delay_ms(150);
-        }
-        else if (current_state == STATE_INFO)
-        {
-            render_info();
-            // Press any key to go back
-            if (btn_mid() || btn_left() || btn_right())
-            {
-                current_state = STATE_MENU;
-                nrf_delay_ms(300);
-            }
+            case STATE_SCANNER:
+                handle_scanner();
+                break;
+            case STATE_MENU:
+                handle_menu();
+                break;
+            case STATE_INFO:
+                handle_info();
+                break;
+            case STATE_SETTINGS:
+                handle_settings();
+                break;
+            default:
+                current_state = STATE_SCANNER;
+                break;
         }
     }
 }
+
+#pragma endregion Main Application
